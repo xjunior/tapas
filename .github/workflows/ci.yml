@@ -37,8 +37,20 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: tapas
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     env:
       TAPAS_TEST_DATABASE_URL: mysql://root:tapas@127.0.0.1:3306
+      TAPAS_TEST_POSTGRES_URL: postgres://postgres:tapas@127.0.0.1:5432
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
