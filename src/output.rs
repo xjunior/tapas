@@ -2,7 +2,7 @@
 
 use std::fmt::{self, Display, Formatter};
 use std::fs::{self, File};
-use std::io::BufWriter;
+use std::io::{self, BufWriter};
 use std::path::{Path, PathBuf};
 use std::thread::{self, JoinHandle};
 
@@ -107,16 +107,11 @@ impl SqlFile {
         let partial = PathBuf::from(format!("{}.partial", path.display()));
         let file =
             File::create(&partial).with_context(|| format!("creating {}", partial.display()))?;
-        let (sender, mut receiver) = mpsc::channel::<Vec<u8>>(256);
+        let (sender, receiver) = mpsc::channel::<Vec<u8>>(256);
 
         let thread = thread::spawn(move || -> Result<()> {
-            let mut out = BufWriter::with_capacity(1 << 20, file);
-            out.write_all(HEADER)?;
-            while let Some(statement) = receiver.blocking_recv() {
-                out.write_all(&statement)?;
-            }
-            out.write_all(FOOTER)?;
-            out.flush()?;
+            let out = BufWriter::with_capacity(1 << 20, file);
+            write_statements(out, receiver)?.flush()?;
             Ok(())
         });
 
@@ -153,6 +148,20 @@ impl SqlFile {
         }
         written.context("writing the SQL file")
     }
+}
+
+/// Writes the header, every statement `receiver` gets, and the footer to `out`, and returns `out`
+/// for the caller to flush or finish.
+fn write_statements<W: io::Write>(
+    mut out: W,
+    mut receiver: mpsc::Receiver<Vec<u8>>,
+) -> io::Result<W> {
+    out.write_all(HEADER)?;
+    while let Some(statement) = receiver.blocking_recv() {
+        out.write_all(&statement)?;
+    }
+    out.write_all(FOOTER)?;
+    Ok(out)
 }
 
 /// Runs INSERT statements against a target database over one connection, inside one
