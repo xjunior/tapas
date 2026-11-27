@@ -1,1 +1,3 @@
 /target
+# Claude Code writes its local settings into .claude/, which is .agents/
+/.agents/settings.local.json
