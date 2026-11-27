@@ -1,0 +1,15 @@
+[package]
+name = "tapas"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.105"
+clap = { version = "4.6.10", features = ["derive", "env"] }
+futures-util = "0.3.34"
+glob = "0.3.4"
+mysql_async = { version = "0.37.1", default-features = false, features = ["default-rustls-ring"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_yaml_ng = "0.10.0"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+xxhash-rust = { version = "0.8.21", features = ["xxh3"] }
