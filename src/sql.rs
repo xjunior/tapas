@@ -97,20 +97,31 @@ pub fn literal(kind: Kind, value: Option<&[u8]>) -> Vec<u8> {
     let Some(bytes) = value else {
         return NULL.to_vec();
     };
+    let capacity = match kind {
+        Kind::Number => bytes.len(),
+        Kind::Text => bytes.len() + 2,
+        Kind::Binary => bytes.len() * 2 + 3,
+    };
+    let mut out = Vec::with_capacity(capacity);
+    push_literal(&mut out, kind, bytes);
+    out
+}
+
+/// Appends `bytes`, a value read with the text protocol, to `out` as a SQL literal.
+pub fn push_literal(out: &mut Vec<u8>, kind: Kind, bytes: &[u8]) {
     match kind {
-        Kind::Number => bytes.to_vec(),
+        Kind::Number => out.extend_from_slice(bytes),
         Kind::Binary => {
-            let mut out = Vec::with_capacity(bytes.len() * 2 + 3);
+            out.reserve(bytes.len() * 2 + 3);
             out.extend_from_slice(b"X'");
             for &byte in bytes {
                 out.push(HEX_DIGITS[usize::from(byte >> 4)]);
                 out.push(HEX_DIGITS[usize::from(byte & 0x0f)]);
             }
             out.push(b'\'');
-            out
         }
         Kind::Text => {
-            let mut out = Vec::with_capacity(bytes.len() + 2);
+            out.reserve(bytes.len() + 2);
             out.push(b'\'');
             for &byte in bytes {
                 match byte {
@@ -124,7 +135,6 @@ pub fn literal(kind: Kind, value: Option<&[u8]>) -> Vec<u8> {
                 }
             }
             out.push(b'\'');
-            out
         }
     }
 }
