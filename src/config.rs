@@ -45,19 +45,14 @@ pub struct Sampler {
     /// Where the sampler was defined, for messages: `users.yml sampler #2 (users)`.
     #[serde(skip)]
     pub origin: String,
-    /// The `--since` condition, filled in by the plan.
-    #[serde(skip)]
-    pub time_filter: Option<String>,
 }
 
 impl Sampler {
-    /// Returns whether the sampler keeps every row of its table.
+    /// Returns whether the sampler has no `where`, `limit` or `of`. `--since` can still narrow
+    /// one with a `time_column`; the plan decides whether it keeps every row.
     #[must_use]
-    pub fn is_full(&self) -> bool {
-        self.filter.is_none()
-            && self.time_filter.is_none()
-            && self.limit.is_none()
-            && self.of.is_empty()
+    pub fn is_unfiltered(&self) -> bool {
+        self.filter.is_none() && self.limit.is_none() && self.of.is_empty()
     }
 }
 
@@ -197,7 +192,7 @@ samplers:
 
         assert_eq!(config.samplers.len(), 2);
         assert!(
-            config.samplers[0].is_full(),
+            config.samplers[0].is_unfiltered(),
             "countries has no filter, limit or deps: {:?}",
             config.samplers[0]
         );
@@ -213,7 +208,7 @@ samplers:
                 column: "id".to_string(),
             }
         );
-        assert!(!users.is_full(), "users has a filter: {users:?}");
+        assert!(!users.is_unfiltered(), "users has a filter: {users:?}");
         Ok(())
     }
 
@@ -235,6 +230,10 @@ samplers:
             config.samplers[0].time_column
         );
         assert_eq!(config.samplers[1].time_column, ["created_at"]);
+        assert!(
+            config.samplers[1].is_unfiltered(),
+            "a time_column only filters once --since says how far back"
+        );
         assert_eq!(config.samplers[2].time_column, ["created_at", "updated_at"]);
         Ok(())
     }

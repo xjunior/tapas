@@ -58,6 +58,16 @@ impl Display for Unit {
 }
 
 impl Since {
+    /// Returns whether the span leaves out some rows of a sampler with these `columns`, without
+    /// building the condition.
+    #[must_use]
+    pub fn narrows(&self, columns: &[String]) -> bool {
+        match self {
+            Since::Ever => false,
+            Since::Back { .. } => !columns.is_empty(),
+        }
+    }
+
     /// Returns the SQL condition for `columns`, or nothing for `Since::Ever`. Rows match when any
     /// of the columns falls on or after midnight of the cutoff day.
     #[must_use]
@@ -65,7 +75,7 @@ impl Since {
         let Since::Back { amount, unit } = self else {
             return None;
         };
-        if columns.is_empty() {
+        if !self.narrows(columns) {
             return None;
         }
         let cutoff = format!("CURDATE() - INTERVAL {amount} {}", unit.sql());
@@ -158,6 +168,24 @@ mod tests {
         let months: Since = "3 months".parse()?;
         assert_eq!(months.to_string(), "3 months");
         assert_eq!(Since::Ever.to_string(), "ever");
+        Ok(())
+    }
+
+    #[test]
+    fn narrows_only_columns_it_has_a_span_for() -> Result<(), String> {
+        let since: Since = "2 weeks".parse()?;
+        assert!(
+            since.narrows(&["created_at".to_string()]),
+            "a span narrows a sampler with a time_column"
+        );
+        assert!(
+            !since.narrows(&[]),
+            "a sampler without a time_column keeps every row"
+        );
+        assert!(
+            !Since::Ever.narrows(&["created_at".to_string()]),
+            "--since ever keeps every row"
+        );
         Ok(())
     }
 
