@@ -3,6 +3,12 @@ name: Release
 on:
   push:
     branches: [main]
+  # Builds and publishes an existing release again, such as one tagged before this workflow.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to build, such as v0.1.0
+        required: true
 
 permissions:
   contents: write
@@ -11,6 +17,7 @@ permissions:
 jobs:
   # Keeps a release PR open with the next version and changelog. Merging it tags the release.
   release-please:
+    if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     outputs:
       created: ${{ steps.release.outputs.release_created }}
@@ -18,3 +25,42 @@ jobs:
     steps:
       - id: release
         uses: googleapis/release-please-action@v4
+
+  # A static binary per platform, attached to the release with its checksum.
+  build:
+    needs: release-please
+    if: ${{ !cancelled() && (inputs.tag != '' || needs.release-please.outputs.created == 'true') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-15
+          - target: x86_64-apple-darwin
+            os: macos-15
+    runs-on: ${{ matrix.os }}
+    env:
+      TAG: ${{ inputs.tag || needs.release-please.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - if: contains(matrix.target, 'linux-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          name="tapas-${TAG}-${{ matrix.target }}"
+          mkdir "$name"
+          cp "target/${{ matrix.target }}/release/tapas" README.md LICENSE CHANGELOG.md "$name/"
+          tar czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+      - run: gh release upload "$TAG" tapas-*.tar.gz tapas-*.tar.gz.sha256 --clobber
