@@ -11,7 +11,8 @@ This page is for people changing tapas.
 | `plan` | Validates the samplers, turns `deps` into samplers, finds cycles, and orders the tables. |
 | `sql` | Builds the queries and the `INSERT`s, and writes values as MySQL literals. |
 | `extract` | Runs the plan: schedules samplers, streams rows, and keeps the values children need. |
-| `output` | Writes the SQL file on its own thread. |
+| `output` | Writes the sample: a SQL file on its own thread, or a target database in one transaction. |
+| `run` | Connects to the source, and wires the plan, the extraction and the output together. |
 
 ## From config to plan
 
@@ -56,10 +57,11 @@ drops duplicates, since rounds can find the same row twice.
 A named sampler keeps the values of its own rows, separately from its table. They're recorded before duplicates are
 dropped, so a row another sampler already wrote still counts as this sampler's.
 
-## The SQL file
+## Writing
 
-The writer thread receives finished `INSERT` statements over a bounded channel, so a slow disk slows the queries down
-rather than filling memory. Values are written from MySQL's text protocol:
+The writer receives finished `INSERT` statements over a bounded channel, so a slow disk or target slows the queries
+down rather than filling memory. It keeps the sample only if the whole run worked: see
+[The output](cli.md#the-output). Values are written from MySQL's text protocol:
 
 | Column type | Written as |
 | --- | --- |
