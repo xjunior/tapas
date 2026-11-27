@@ -147,7 +147,8 @@ pub struct Dep {
     pub allowed: Allowed,
 }
 
-/// Builds the SELECTs that run one sampler, without LIMIT. Values lists longer than `chunk_size`
+/// Builds the SELECTs that run one sampler, without LIMIT. `time_filter` is the plan's
+/// `--since` condition, if any. Values lists longer than `chunk_size`
 /// are split, and every combination of chunks becomes its own query, so no row matches two
 /// queries.
 ///
@@ -155,7 +156,12 @@ pub struct Dep {
 ///
 /// Panics if `chunk_size` is 0.
 #[must_use]
-pub fn sampler_queries(sampler: &Sampler, deps: &[Dep], chunk_size: usize) -> Vec<Vec<u8>> {
+pub fn sampler_queries(
+    sampler: &Sampler,
+    time_filter: Option<&str>,
+    deps: &[Dep],
+    chunk_size: usize,
+) -> Vec<Vec<u8>> {
     let mut combinations: Vec<Vec<Vec<u8>>> = vec![Vec::new()];
 
     for Dep { column, allowed } in deps {
@@ -190,7 +196,7 @@ pub fn sampler_queries(sampler: &Sampler, deps: &[Dep], chunk_size: usize) -> Ve
 
     combinations
         .into_iter()
-        .map(|conditions| select(sampler, conditions))
+        .map(|conditions| select(sampler, time_filter, conditions))
         .collect()
 }
 
@@ -211,12 +217,12 @@ fn in_list(column: &str, values: &[Vec<u8>]) -> Vec<u8> {
 }
 
 #[must_use]
-fn select(sampler: &Sampler, dep_conditions: Vec<Vec<u8>>) -> Vec<u8> {
+fn select(sampler: &Sampler, time_filter: Option<&str>, dep_conditions: Vec<Vec<u8>>) -> Vec<u8> {
     let mut conditions: Vec<Vec<u8>> = Vec::new();
     if let Some(filter) = &sampler.filter {
         conditions.push(format!("({filter})").into_bytes());
     }
-    if let Some(time_filter) = &sampler.time_filter {
+    if let Some(time_filter) = time_filter {
         conditions.push(time_filter.as_bytes().to_vec());
     }
     conditions.extend(dep_conditions);
@@ -350,7 +356,7 @@ mod tests {
     #[test]
     fn quotes_names_in_every_statement() -> Result<(), Utf8Error> {
         let deps = [dep("we`ird", values(&["1"]))];
-        let queries = sampler_queries(&sampler("ta`ble", None, None), &deps, 10);
+        let queries = sampler_queries(&sampler("ta`ble", None, None), None, &deps, 10);
         assert_eq!(
             text(&queries[0])?,
             "SELECT * FROM `ta``ble` WHERE `we``ird` IN (1)"
@@ -365,7 +371,7 @@ mod tests {
 
     #[test]
     fn builds_a_plain_select() -> Result<(), Utf8Error> {
-        let queries = sampler_queries(&sampler("countries", None, None), &[], 10);
+        let queries = sampler_queries(&sampler("countries", None, None), None, &[], 10);
         assert_eq!(queries.len(), 1);
         assert_eq!(text(&queries[0])?, "SELECT * FROM `countries`");
         Ok(())
@@ -376,6 +382,7 @@ mod tests {
         let deps = [dep("country_id", Allowed::AnyValue)];
         let queries = sampler_queries(
             &sampler("users", Some("a = 1 OR b = 2"), Some("id DESC")),
+            None,
             &deps,
             10,
         );
@@ -388,11 +395,11 @@ mod tests {
 
     #[test]
     fn adds_the_time_filter_after_the_filter() -> Result<(), Utf8Error> {
-        let mut orders = sampler("orders", Some("total > 0"), None);
-        orders.time_filter = Some("`created_at` >= CURDATE() - INTERVAL 2 WEEK".to_string());
+        let orders = sampler("orders", Some("total > 0"), None);
+        let time_filter = Some("`created_at` >= CURDATE() - INTERVAL 2 WEEK");
         let deps = [dep("user_id", values(&["1"]))];
         assert_eq!(
-            text(&sampler_queries(&orders, &deps, 10)[0])?,
+            text(&sampler_queries(&orders, time_filter, &deps, 10)[0])?,
             "SELECT * FROM `orders` WHERE (total > 0) AND `created_at` >= CURDATE() - INTERVAL 2 WEEK \
              AND `user_id` IN (1)"
         );
@@ -405,7 +412,7 @@ mod tests {
             dep("user_id", values(&["1", "2", "3"])),
             dep("number_id", values(&["7", "8"])),
         ];
-        let queries = sampler_queries(&sampler("phones", None, None), &deps, 2);
+        let queries = sampler_queries(&sampler("phones", None, None), None, &deps, 2);
         let queries: Vec<&str> = queries
             .iter()
             .map(|query| text(query))
@@ -424,7 +431,7 @@ mod tests {
     #[test]
     fn skips_samplers_whose_parents_extracted_nothing() {
         let deps = [dep("user_id", values(&[]))];
-        let queries = sampler_queries(&sampler("phones", None, None), &deps, 10);
+        let queries = sampler_queries(&sampler("phones", None, None), None, &deps, 10);
         assert!(
             queries.is_empty(),
             "a parent with no values allows no rows, yet got {} queries",

@@ -16,7 +16,8 @@ This page is for people changing tapas.
 
 ## From config to plan
 
-1. Every sampler gets its `time_column` condition when `--since` is a span.
+1. `--since` stays in the plan; the configured samplers aren't changed. A sampler with a `time_column` gets the
+   condition when its queries are built, and doesn't count as taking every row when `--since` is a span.
 2. Each `deps` reference, `table.column → parent.column`, becomes one extra sampler on the parent:
    `of: { parent.column: table.column }`. A parent that already takes every row gets none.
 3. Each `of` adds an edge from the parent table to the child. A named sampler stands for its table.

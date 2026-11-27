@@ -373,7 +373,13 @@ fn current_deps(
 
 async fn run_sampler(context: &Arc<Shared>, index: usize, deps: Vec<Dep>) -> Result<()> {
     let sampler = &context.plan.samplers[index];
-    let queries = sql::sampler_queries(sampler, &deps, context.options.chunk_size);
+    let time_filter = context.plan.time_filter(index);
+    let queries = sql::sampler_queries(
+        sampler,
+        time_filter.as_deref(),
+        &deps,
+        context.options.chunk_size,
+    );
     if queries.is_empty() {
         return Ok(());
     }

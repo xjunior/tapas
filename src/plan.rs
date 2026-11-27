@@ -52,20 +52,14 @@ impl Plan {
     /// contradict each other or depend on tables nothing extracts.
     pub fn try_new(config: Config, since: Option<Since>) -> Result<Self> {
         let mut samplers = config.samplers;
-        if let Some(since) = since {
-            for sampler in &mut samplers {
-                sampler.time_filter = since.condition(&sampler.time_column);
-            }
-        }
-
-        pull_referenced_rows(&mut samplers)?;
+        pull_referenced_rows(&mut samplers, since)?;
 
         let mut tables: BTreeMap<String, TablePlan> = BTreeMap::new();
 
         for (index, sampler) in samplers.iter().enumerate() {
             let table = tables.entry(sampler.table.clone()).or_default();
             table.samplers.push(index);
-            table.full |= sampler.is_full();
+            table.full |= keeps_every_row(sampler, since);
         }
 
         let mut named: BTreeMap<String, usize> = BTreeMap::new();
@@ -201,9 +195,19 @@ impl Plan {
     #[must_use]
     pub fn allows_any(&self, parent: &ColumnRef) -> bool {
         match self.named.get(&parent.table) {
-            Some(&index) => self.samplers[index].is_full(),
+            Some(&index) => keeps_every_row(&self.samplers[index], self.since),
             None => self.tables[&parent.table].full,
         }
+    }
+
+    /// Returns the `--since` condition on sampler `index`'s `time_column`, if it has one.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` isn't a sampler of this plan.
+    #[must_use]
+    pub fn time_filter(&self, index: usize) -> Option<String> {
+        self.since?.condition(&self.samplers[index].time_column)
     }
 
     /// Returns whether sampler `index` runs in rounds until its cycle stops growing.
@@ -251,7 +255,10 @@ impl Plan {
         let limited = self
             .samplers
             .iter()
-            .filter(|sampler| sampler.time_filter.is_some())
+            .filter(|sampler| {
+                self.since
+                    .is_some_and(|since| since.narrows(&sampler.time_column))
+            })
             .count();
         let mut out = format!(
             "{} tables, {} samplers, {timed} with a time_column\n",
@@ -307,7 +314,9 @@ impl Plan {
                     })
                     .collect();
                 // Every dep allows one placeholder value, so there's exactly one query.
-                let mut query = sql::sampler_queries(sampler, &deps, 1).remove(0);
+                let time_filter = self.time_filter(index);
+                let mut query =
+                    sql::sampler_queries(sampler, time_filter.as_deref(), &deps, 1).remove(0);
                 if let Some(limit) = sampler.limit {
                     query.extend_from_slice(format!(" LIMIT {limit}").as_bytes());
                 }
@@ -331,14 +340,14 @@ impl Plan {
 /// parent gets a sampler for exactly the rows they point at: `of: { parent_column: table.column }`.
 /// Deps belong to the table, so the pulled rows include those pointed at by rows other samplers
 /// (pulls included) brought in. A parent that keeps every row needs no pull.
-fn pull_referenced_rows(samplers: &mut Vec<Sampler>) -> Result<()> {
+fn pull_referenced_rows(samplers: &mut Vec<Sampler>, since: Option<Since>) -> Result<()> {
     let names: BTreeSet<&str> = samplers
         .iter()
         .filter_map(|sampler| sampler.name.as_deref())
         .collect();
     let full: BTreeSet<&str> = samplers
         .iter()
-        .filter(|sampler| sampler.is_full())
+        .filter(|sampler| keeps_every_row(sampler, since))
         .map(|sampler| sampler.table.as_str())
         .collect();
 
@@ -380,6 +389,12 @@ fn pull_referenced_rows(samplers: &mut Vec<Sampler>) -> Result<()> {
         .collect();
     samplers.extend(pulls);
     Ok(())
+}
+
+/// Returns whether `sampler` keeps every row of its table once `since` applies.
+#[must_use]
+fn keeps_every_row(sampler: &Sampler, since: Option<Since>) -> bool {
+    sampler.is_unfiltered() && !since.is_some_and(|since| since.narrows(&sampler.time_column))
 }
 
 #[must_use]
@@ -513,18 +528,30 @@ samplers:
     #[test]
     fn applies_since_to_samplers_with_a_time_column() -> Result<()> {
         let plan = plan_since(TIMED, "2 weeks")?;
-        assert_eq!(plan.samplers[0].time_filter, None);
+        assert_eq!(plan.time_filter(0), None);
         assert_eq!(
-            plan.samplers[1].time_filter.as_deref(),
+            plan.time_filter(1).as_deref(),
             Some(
                 "(`created_at` >= CURDATE() - INTERVAL 2 WEEK OR `updated_at` >= CURDATE() - INTERVAL 2 WEEK)"
             )
         );
         assert_eq!(
-            plan.samplers[2].time_filter.as_deref(),
+            plan.time_filter(2).as_deref(),
             Some("`created_at` >= CURDATE() - INTERVAL 2 WEEK")
         );
         plan.check_since()
+    }
+
+    #[test]
+    fn leaves_the_configured_samplers_as_they_were() -> Result<()> {
+        let config: Config = TIMED.parse()?;
+        let since: Since = "2 weeks".parse().map_err(anyhow::Error::msg)?;
+        let plan = Plan::try_new(config.clone(), Some(since))?;
+        assert_eq!(
+            plan.samplers, config.samplers,
+            "--since lives in the plan, not in the samplers"
+        );
+        Ok(())
     }
 
     #[test]
@@ -544,10 +571,8 @@ samplers:
     #[test]
     fn since_ever_keeps_every_row() -> Result<()> {
         let plan = plan_since(TIMED, "ever")?;
-        let filters: Vec<Option<&str>> = plan
-            .samplers
-            .iter()
-            .map(|sampler| sampler.time_filter.as_deref())
+        let filters: Vec<Option<String>> = (0..plan.samplers.len())
+            .map(|index| plan.time_filter(index))
             .collect();
         assert!(
             filters.iter().all(|filter| filter.is_none()),
@@ -948,14 +973,15 @@ samplers:
         assert_eq!(users[1].of["id"].to_string(), "orders.user_id");
 
         // orders: only its time window; it runs before the users it points at.
-        let orders = &plan.samplers[plan.tables["orders"].samplers[0]];
+        let orders_index = plan.tables["orders"].samplers[0];
+        let orders = &plan.samplers[orders_index];
         assert!(
             orders.of.is_empty(),
             "deps don't narrow the orders sampler: {:?}",
             orders.of
         );
         assert!(
-            orders.time_filter.is_some(),
+            plan.time_filter(orders_index).is_some(),
             "orders has a time_column and --since is given"
         );
         assert_eq!(
