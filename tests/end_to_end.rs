@@ -126,6 +126,7 @@ async fn extracts_a_sample_that_keeps_references() -> Result<()> {
         Options {
             chunk_size: 7,
             batch_rows: 13,
+            ..Options::default()
         },
     )
     .await?;

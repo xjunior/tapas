@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Result, bail};
 
-use crate::config::{ColumnRef, Config, Sampler};
+use crate::config::{ColumnRef, Config, Sampler, Sanitize};
 use crate::since::Since;
 use crate::sql::{self, Allowed, Dep};
 
@@ -45,13 +45,18 @@ pub struct Plan {
     pub named_keep: BTreeMap<String, BTreeSet<String>>,
     /// How far back samplers with a `time_column` reach, when `--since` was given.
     pub since: Option<Since>,
+    /// What to write in place of sensitive values.
+    pub sanitize: Sanitize,
 }
 
 impl Plan {
     /// Plans the extraction of `config`'s samplers, limited by `since`. Fails when the samplers
     /// contradict each other or depend on tables nothing extracts.
     pub fn try_new(config: Config, since: Option<Since>) -> Result<Self> {
-        let mut samplers = config.samplers;
+        let Config {
+            mut samplers,
+            sanitize,
+        } = config;
         pull_referenced_rows(&mut samplers, since)?;
 
         let mut tables: BTreeMap<String, TablePlan> = BTreeMap::new();
@@ -116,6 +121,17 @@ impl Plan {
             }
         }
 
+        for (table, rules) in &sanitize.tables {
+            if !tables.contains_key(table)
+                && let Some(rule) = rules.first()
+            {
+                bail!(
+                    "{}: sanitize.tables.{table} names a table no sampler extracts",
+                    rule.file
+                );
+            }
+        }
+
         let (order, cycles) = components(&tables);
         for (index, cycle) in cycles.iter().enumerate() {
             for name in cycle {
@@ -137,6 +153,7 @@ impl Plan {
             named,
             named_keep,
             since,
+            sanitize,
         };
         for (index, sampler) in plan.samplers.iter().enumerate() {
             if let Some(cycle) = plan.tables[&sampler.table].cycle
@@ -198,6 +215,37 @@ impl Plan {
             Some(&index) => keeps_every_row(&self.samplers[index], self.since),
             None => self.tables[&parent.table].full,
         }
+    }
+
+    /// Returns the columns of `table` that references follow, from either side: the columns
+    /// children follow, and the table's own `of` and `deps` columns. Sanitizing one would break a
+    /// reference.
+    #[must_use]
+    pub fn references(&self, table: &str) -> BTreeSet<&str> {
+        let mut columns: BTreeSet<&str> = BTreeSet::new();
+        let Some(plan) = self.tables.get(table) else {
+            return columns;
+        };
+        columns.extend(plan.keep.iter().map(String::as_str));
+        for &index in &plan.samplers {
+            let sampler = &self.samplers[index];
+            columns.extend(sampler.of.keys().map(String::as_str));
+            columns.extend(sampler.deps.keys().map(String::as_str));
+            if let Some(name) = &sampler.name
+                && let Some(kept) = self.named_keep.get(name)
+            {
+                columns.extend(kept.iter().map(String::as_str));
+            }
+        }
+        // A dep on a table that takes every row pulls nothing in, so it isn't in `keep`.
+        for sampler in &self.samplers {
+            for parent in sampler.deps.values() {
+                if parent.table == table {
+                    columns.insert(&parent.column);
+                }
+            }
+        }
+        columns
     }
 
     /// Returns the `--since` condition on sampler `index`'s `time_column`, if it has one.
@@ -274,6 +322,13 @@ impl Plan {
             }
         };
         out.push_str(&since_line);
+        if let Some(rule) = self.sanitize.columns.first() {
+            out.push_str(&format!(
+                "sanitize: {} rules for every table, from {}\n",
+                self.sanitize.columns.len(),
+                rule.file
+            ));
+        }
 
         for name in &self.order {
             let table = &self.tables[name];
@@ -289,6 +344,13 @@ impl Plan {
             }
             if table.full {
                 notes.push("every row".to_string());
+            }
+            if let Some(rules) = self.sanitize.tables.get(name) {
+                let rules: Vec<String> = rules
+                    .iter()
+                    .map(|rule| format!("{}: {}", rule.pattern, rule.replacement))
+                    .collect();
+                notes.push(format!("sanitizes {}", rules.join(", ")));
             }
             out.push_str(&format!("\n{name}"));
             if !notes.is_empty() {
@@ -702,6 +764,94 @@ samplers:
             !plan.tables["orders"].dedupe,
             "orders has one sampler and no cycle"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn knows_which_columns_references_follow() -> Result<()> {
+        let plan = plan(
+            r#"
+samplers:
+  - table: written_off_projects
+    name: recent_write_offs
+    where: created_at > '2024-01-01'
+  - table: projects
+    of:
+      id: recent_write_offs.project_id
+  - table: orders
+    deps:
+      user_id: users.id
+  - table: countries
+  - table: addresses
+    deps:
+      country_code: countries.code
+"#,
+        )?;
+        let references = |table: &str| -> Vec<String> {
+            plan.references(table)
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        };
+        // Followed by a child through a named sampler, by the child's own `of`, by `deps` from
+        // the child's side, and on the parent's side.
+        assert_eq!(references("written_off_projects"), ["project_id"]);
+        assert_eq!(references("projects"), ["id"]);
+        assert_eq!(references("orders"), ["user_id"]);
+        assert_eq!(references("users"), ["id"]);
+        // countries takes every row, so the dep pulls nothing in, but it's still a reference.
+        assert_eq!(references("addresses"), ["country_code"]);
+        assert_eq!(references("countries"), ["code"]);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_sanitize_rules_for_tables_nothing_extracts() {
+        let error = plan(
+            "samplers:\n  - table: users\nsanitize:\n  tables:\n    user:\n      email: null\n",
+        )
+        .expect_err("no sampler extracts `user`");
+        assert_eq!(
+            error.to_string(),
+            "config: sanitize.tables.user names a table no sampler extracts"
+        );
+    }
+
+    #[test]
+    fn describes_sanitize_rules() -> Result<()> {
+        let described = plan(
+            r#"
+samplers:
+  - table: users
+  - table: orders
+sanitize:
+  columns:
+    "*email*": { fake: email }
+    ssn: null
+  tables:
+    users:
+      login: { template: "user_{id}" }
+      retain_email: keep
+"#,
+        )?
+        .describe();
+        assert!(
+            described.contains("sanitize: 2 rules for every table, from config\n"),
+            "{described}"
+        );
+        assert!(
+            described.contains(
+                "users  (every row; sanitizes login: template user_{id}, retain_email: keep)"
+            ),
+            "{described}"
+        );
+        assert!(
+            described.contains("orders  (every row)\n"),
+            "orders has no rules of its own: {described}"
+        );
+
+        let plain = plan(SHOP)?.describe();
+        assert!(!plain.contains("sanitize"), "{plain}");
         Ok(())
     }
 

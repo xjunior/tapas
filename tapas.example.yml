@@ -31,3 +31,14 @@ samplers:
   - table: line_items
     of:
       order_id: orders.id
+
+# Personal data is replaced on the way out: see docs/sanitization.md. The same email gets the
+# same fake in every table.
+sanitize:
+  columns:
+    "*email*": { fake: email }
+  tables:
+    users:
+      name: { fake: name }
+    phones:
+      number: { fake: phone }

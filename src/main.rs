@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use clap::Parser;
+use tapas::sanitize::Seed;
 use tapas::{Config, Options, Output, Plan, Since};
 
 /// Extracts a sample of a MySQL database that keeps its references intact.
@@ -55,6 +56,11 @@ struct Args {
     /// Rows per INSERT statement.
     #[arg(long, default_value_t = 500)]
     batch_rows: usize,
+
+    /// Any text that fake values start from. With the same seed, the same original value gets
+    /// the same fake one in every run; keep it secret. Without it, each run picks its own.
+    #[arg(long, env = "TAPAS_SANITIZE_SEED", hide_env_values = true)]
+    sanitize_seed: Option<Seed>,
 }
 
 #[tokio::main]
@@ -79,6 +85,7 @@ async fn main() -> Result<()> {
     let options = Options {
         chunk_size: args.chunk_size.max(1),
         batch_rows: args.batch_rows.max(1),
+        sanitize_seed: args.sanitize_seed,
     };
     let rows = tapas::run(plan, &source, args.connections, &output, options).await?;
 

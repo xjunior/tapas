@@ -8,6 +8,8 @@ samplers:
     where: activated_at IS NOT NULL
 ```
 
+A config can also say how to replace sensitive values, under `sanitize:`. See [Sanitization](sanitization.md).
+
 ## Files
 
 Pass as many files as you like. Quote a glob and tapas expands it itself, `**` included:
@@ -17,6 +19,7 @@ tapas 'apps/**/tapas.yml' shared.yml -o sample.sql
 ```
 
 All the files' samplers are merged into one list, so a sampler in one file can follow a table another file extracts.
+A file can hold only samplers, only [`sanitize:`](sanitization.md#many-files) rules, or both.
 A pattern that matches nothing is an error, and a file matched twice is read once. Unknown keys are errors too, so a
 typo like `limt: 100` never goes unnoticed.
 

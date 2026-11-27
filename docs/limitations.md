@@ -4,8 +4,13 @@ What tapas doesn't do yet, or does in a way worth knowing about.
 
 ## Data
 
-- **No sanitization.** Every value is copied as it is. Don't run tapas against data that holds personal or secret
-  information unless the target is as protected as the source.
+- **Sanitization only covers the columns you name.** A column that no rule matches is copied as it is. Check new
+  columns against your [`sanitize:`](sanitization.md) rules, and keep the target as protected as the source until
+  you have.
+- **Columns that references follow can't be sanitized.** Changing them would break the reference. Sanitize the
+  sensitive columns around them.
+- **Free text isn't scanned.** A `notes` column that mentions an email keeps it, unless a rule replaces the whole
+  column.
 - **No single snapshot.** Each query sees the source as it is when it runs, so a sample taken while the source changes
   can catch a row without one it was just given.
 - **References are only as good as the source.** A row that points at one missing from the source points at nothing

@@ -11,6 +11,8 @@ one that was left behind.
 - **References that hold.** `deps` brings along every row your rows point at. `of` takes the rows that belong to what's
   already in the sample.
 - **One config, many sizes.** `--since '2 weeks'` for a laptop, `--since '3 months'` for a review environment.
+- **No personal data.** Replace emails, names, SSNs and more with fakes that look real. The same email gets the same
+  fake everywhere it appears, so data that matched still matches.
 - **Fast.** Independent tables, samplers and chunks all run at once, over a pool of read-only connections.
 - **Look before you leap.** `--plan` prints every query without touching the database.
 
@@ -78,10 +80,11 @@ command line too: see [Command line](docs/cli.md#connection-urls). There's a ful
 ## Documentation
 
 - [Configuration](docs/configuration.md): samplers, `of`, `deps`, names, time windows and cycles.
+- [Sanitization](docs/sanitization.md): replacing sensitive values with fakes, fixed values or templates.
 - [Command line](docs/cli.md): every flag, connection URLs and their environment variables, and what the output
   looks like.
 - [How it works](docs/how-it-works.md): planning, scheduling and cycles, for people changing tapas.
-- [Limitations](docs/limitations.md): what tapas doesn't do yet, sanitization included.
+- [Limitations](docs/limitations.md): what tapas doesn't do yet.
 - [Development](docs/development.md): building and testing.
 
 See [CHANGELOG.md](CHANGELOG.md) for what changed in each version.
