@@ -2,6 +2,18 @@
 
 Every notable change to tapas lands here. Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0](https://github.com/xjunior/tapas/compare/v0.2.0...v0.3.0) (2026-11-27)
+
+
+### Features
+
+* read from and write to Postgres ([#9](https://github.com/xjunior/tapas/issues/9)) ([cc9e2a2](https://github.com/xjunior/tapas/commit/cc9e2a22d81dddf168aa501a866969644c06d657))
+
+
+### Bug Fixes
+
+* say why the target refused a statement ([#11](https://github.com/xjunior/tapas/issues/11)) ([43003a5](https://github.com/xjunior/tapas/commit/43003a59704cf887ecda65bf9c3c652cc751aa6d))
+
 ## [0.2.0](https://github.com/xjunior/tapas/compare/v0.1.0...v0.2.0) (2026-11-27)
 
 
