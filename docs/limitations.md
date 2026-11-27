@@ -18,7 +18,9 @@ What tapas doesn't do yet, or does in a way worth knowing about.
 
 ## Output
 
-- **No schema.** The target, file or database, needs every table already.
+- **No schema.** The target, file or database, needs every table already, with every column the source has. A
+  target behind on migrations refuses the INSERTs, and tapas stops with the statement and the target's error, such
+  as ``running INSERT INTO `users` (`id`, `name`) VALUES …`` and `Unknown column 'name' in 'field list'`.
 - **The same kind of database in and out.** A MySQL source writes MySQL SQL and a Postgres source writes Postgres
   SQL. tapas refuses a target of the other kind.
 - **One Postgres schema.** tapas reads and writes the tables of the connection's current schema. See

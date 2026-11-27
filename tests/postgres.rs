@@ -363,3 +363,45 @@ async fn says_what_a_target_user_needs_to_skip_foreign_key_checks() -> Result<()
         .await?;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn says_why_the_target_refused_a_statement() -> Result<()> {
+    let Ok(base) = env::var("TAPAS_TEST_POSTGRES_URL") else {
+        eprintln!("TAPAS_TEST_POSTGRES_URL not set, skipping");
+        return Ok(());
+    };
+    let databases = ["tapas_pg_refused_source", "tapas_pg_refused_target"];
+    let admin = create_databases(&base, databases).await?;
+    // As after a migration the target hasn't run. One row per statement makes extraction still
+    // be sending when the target refuses the first one.
+    connect(&format!("{base}/{}", databases[1]))
+        .await?
+        .batch_execute("ALTER TABLE orders DROP COLUMN total")
+        .await?;
+    let config: Config = "samplers:\n  - table: orders\n".parse()?;
+
+    let error = tapas::run(
+        Plan::try_new(config, None)?,
+        &format!("{base}/{}", databases[0]),
+        2,
+        &Output::Database(format!("{base}/{}", databases[1])),
+        Options {
+            batch_rows: 1,
+            ..Options::default()
+        },
+    )
+    .await
+    .expect_err("the target has no total column");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains(r#"INSERT INTO "orders" ("id", "user_id", "total", "placed_at")"#),
+        "names the statement: {message}"
+    );
+    assert!(
+        message.contains(r#"column "total" of relation "orders" does not exist"#),
+        "gives the target's reason: {message}"
+    );
+
+    drop_databases(&admin, databases).await?;
+    Ok(())
+}
