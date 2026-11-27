@@ -1,0 +1,69 @@
+# How it works
+
+This page is for people changing tapas.
+
+## Pieces
+
+| Module | Role |
+| --- | --- |
+| `config` | Loads the YAML files, expands globs, and labels each sampler with where it came from. |
+| `since` | Parses `--since` and turns a `time_column` into a SQL condition. |
+| `plan` | Validates the samplers, turns `deps` into samplers, finds cycles, and orders the tables. |
+| `sql` | Builds the queries and the `INSERT`s, and writes values as MySQL literals. |
+| `extract` | Runs the plan: schedules samplers, streams rows, and keeps the values children need. |
+| `output` | Writes the SQL file on its own thread. |
+
+## From config to plan
+
+1. Every sampler gets its `time_column` condition when `--since` is a span.
+2. Each `deps` reference, `table.column → parent.column`, becomes one extra sampler on the parent:
+   `of: { parent.column: table.column }`. A parent that already takes every row gets none.
+3. Each `of` adds an edge from the parent table to the child. A named sampler stands for its table.
+4. Tarjan's algorithm groups the tables into strongly connected components. A component with several tables, or one
+   table that follows itself, is a cycle.
+5. Every table remembers the columns its children follow (`keep`), and named samplers do the same for their own rows.
+
+A table is **full** when one of its samplers takes every row. An `of` on a full table needs no values: it becomes
+`column IS NOT NULL`.
+
+## Running
+
+- A sampler outside a cycle starts as soon as every table it follows is done. A table is done when all its samplers
+  are.
+- A cycle starts as one unit once every table outside it that it follows is done.
+- Within a sampler, long value lists are split into chunks of `--chunk-size`. Several `of` lists become every
+  combination of their chunks, so no row comes back from two queries.
+- Chunks run in parallel, except for a sampler with a `limit`, which runs them one after another until it has enough.
+- Rows stream into batches. A batch drops rows the table already has, keeps the values children need, and goes to the
+  writer as one `INSERT`.
+
+Duplicates are found by hashing each row with 128-bit xxh3. Tables with a single sampler, outside any cycle, skip that.
+
+## Cycles
+
+A cycle runs in two steps.
+
+1. **Seeds.** Samplers that don't follow anything inside the cycle run once.
+2. **Rounds.** The other samplers run again and again. A sampler that follows one table of its cycle only receives the
+   values found since its previous round; one that follows several receives all of them, since a new row can come from
+   any combination. The cycle ends when a round writes no new rows.
+
+Values are kept in the order they were found, so "new since the previous round" is a slice. Every table in a cycle
+drops duplicates, since rounds can find the same row twice.
+
+## Named samplers
+
+A named sampler keeps the values of its own rows, separately from its table. They're recorded before duplicates are
+dropped, so a row another sampler already wrote still counts as this sampler's.
+
+## The SQL file
+
+The writer thread receives finished `INSERT` statements over a bounded channel, so a slow disk slows the queries down
+rather than filling memory. Values are written from MySQL's text protocol:
+
+| Column type | Written as |
+| --- | --- |
+| Integers, decimals, floats, `YEAR` | As they are |
+| Dates, times, `JSON` | Quoted strings |
+| `BIT`, geometry, binary strings and blobs | Hex, as `X'…'` |
+| Everything else | Quoted, with `\`, `'`, NUL, newlines and `\Z` escaped |
