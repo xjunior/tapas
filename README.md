@@ -2,7 +2,8 @@
 
 Small plates of your production data.
 
-tapas pulls a sample out of a MySQL database and writes it to a SQL file, keeping every reference intact. You describe
+tapas pulls a sample out of a MySQL database and writes it to a SQL file or straight into another database, keeping
+every reference intact. You describe
 what to take in YAML; tapas works out the order, runs everything it can in parallel, and makes sure no row points at
 one that was left behind.
 
@@ -57,20 +58,28 @@ samplers:
 Check it, run it, load it:
 
 ```sh
-export TAPAS_SOURCE_URL='mysql://user:password@host:3306/shop'
-
 tapas tapas.yml --since '2 weeks' --plan
-tapas tapas.yml --since '2 weeks' -o sample.sql
+tapas tapas.yml --since '2 weeks' --source mysql://user:password@host:3306/shop -o sample.sql
 mysql shop_dev < sample.sql
 ```
 
-The file holds `INSERT` statements only, so load it into a database that already has the schema. There's a fuller
-example in [tapas.example.yml](tapas.example.yml).
+Or skip the file and pour it straight into another database:
+
+```sh
+tapas tapas.yml --since '2 weeks' \
+  --source mysql://user:password@host:3306/shop \
+  --target mysql://root@localhost:3306/shop_dev
+```
+
+Either way tapas writes `INSERT` statements only, so the target needs the schema already. Passwords can stay off the
+command line too: see [Command line](docs/cli.md#connection-urls). There's a fuller example in
+[tapas.example.yml](tapas.example.yml).
 
 ## Documentation
 
 - [Configuration](docs/configuration.md): samplers, `of`, `deps`, names, time windows and cycles.
-- [Command line](docs/cli.md): every flag, and what the output looks like.
+- [Command line](docs/cli.md): every flag, connection URLs and their environment variables, and what the output
+  looks like.
 - [How it works](docs/how-it-works.md): planning, scheduling and cycles, for people changing tapas.
 - [Limitations](docs/limitations.md): what tapas doesn't do yet, sanitization included.
 - [Development](docs/development.md): building and testing.

@@ -1,9 +1,10 @@
 use std::path::PathBuf;
+
 use std::time::Instant;
 
 use anyhow::Result;
 use clap::Parser;
-use tapas::{Config, Options, Plan, Since};
+use tapas::{Config, Options, Output, Plan, Since};
 
 /// Extracts a sample of a MySQL database that keeps its references intact.
 #[derive(Parser)]
@@ -33,8 +34,14 @@ struct Args {
     source: Option<String>,
 
     /// SQL file to write the sample to.
-    #[arg(long, short, required_unless_present = "plan")]
+    #[arg(long, short, required_unless_present_any = ["plan", "target"], conflicts_with = "target")]
     output: Option<PathBuf>,
+
+    /// Database to write the sample straight into, as mysql://user:password@host:port/database.
+    /// Its tables must exist. Everything goes in one transaction, committed only if the whole
+    /// sample worked.
+    #[arg(long, env = "TAPAS_TARGET_URL", hide_env_values = true)]
+    target: Option<String>,
 
     /// Most connections open to the source at once.
     #[arg(long, default_value_t = 8)]
@@ -60,8 +67,13 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let (Some(source), Some(output)) = (args.source, args.output) else {
-        unreachable!("clap requires --source and --output without --plan");
+    let Some(source) = args.source else {
+        unreachable!("clap requires --source without --plan");
+    };
+    let output = match (args.output, args.target) {
+        (Some(path), _) => Output::File(path),
+        (None, Some(url)) => Output::Database(url),
+        (None, None) => unreachable!("clap requires --output or --target without --plan"),
     };
     let options = Options {
         chunk_size: args.chunk_size.max(1),
@@ -77,7 +89,7 @@ async fn main() -> Result<()> {
     eprintln!(
         "{total:>12}  rows in {:.2}s -> {}",
         started.elapsed().as_secs_f64(),
-        output.display()
+        output
     );
     Ok(())
 }

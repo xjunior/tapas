@@ -99,7 +99,7 @@ async fn extracts_cycles_until_they_stop_growing() {
         plan,
         &format!("{base}/tapas_cycles_source"),
         4,
-        &output,
+        &tapas::Output::File(output.clone()),
         // Tiny chunks, so each round's new values span several queries.
         tapas::Options {
             chunk_size: 2,

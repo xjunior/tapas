@@ -75,7 +75,7 @@ async fn deps_pull_in_what_the_rows_point_at() {
         plan,
         &format!("{base}/tapas_refs_source"),
         4,
-        &output,
+        &tapas::Output::File(output.clone()),
         tapas::Options::default(),
     )
     .await
