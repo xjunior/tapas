@@ -2,11 +2,13 @@
 
 use std::fmt::{self, Display, Formatter};
 use std::fs::{self, File};
-use std::io::BufWriter;
+use std::io::{self, BufWriter};
 use std::path::{Path, PathBuf};
 use std::thread::{self, JoinHandle};
 
 use anyhow::{Context, Result};
+use flate2::Compression;
+use flate2::write::GzEncoder;
 use mysql_async::prelude::Queryable;
 use mysql_async::{Conn, Opts};
 use tokio::sync::mpsc;
@@ -18,7 +20,7 @@ const FOOTER: &[u8] = b"\nSET FOREIGN_KEY_CHECKS=1;\n";
 /// Where the sample goes.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Output {
-    /// A SQL file of INSERT statements.
+    /// A SQL file of INSERT statements, gzipped when its path ends in `.gz`.
     File(PathBuf),
     /// A MySQL database, as mysql://user:password@host:port/database.
     Database(String),
@@ -89,8 +91,9 @@ impl Sink {
     }
 }
 
-/// Writes INSERT statements to `<path>.partial` on its own thread. The file is only moved to
-/// `path` by `finish`, so a failed run never leaves something that looks like a full sample.
+/// Writes INSERT statements to `<path>.partial` on its own thread, gzipped when `path` ends in
+/// `.gz`. The file is only moved to `path` by `finish`, so a failed run never leaves something
+/// that looks like a full sample.
 #[must_use = "call `finish` to wait for the statements and keep or discard them"]
 pub struct SqlFile {
     path: PathBuf,
@@ -104,19 +107,21 @@ impl SqlFile {
     pub fn create(path: &Path) -> Result<(Self, mpsc::Sender<Vec<u8>>)> {
         use std::io::Write;
 
+        let encoding = Encoding::for_path(path);
         let partial = PathBuf::from(format!("{}.partial", path.display()));
         let file =
             File::create(&partial).with_context(|| format!("creating {}", partial.display()))?;
-        let (sender, mut receiver) = mpsc::channel::<Vec<u8>>(256);
+        let (sender, receiver) = mpsc::channel::<Vec<u8>>(256);
 
         let thread = thread::spawn(move || -> Result<()> {
-            let mut out = BufWriter::with_capacity(1 << 20, file);
-            out.write_all(HEADER)?;
-            while let Some(statement) = receiver.blocking_recv() {
-                out.write_all(&statement)?;
+            let out = BufWriter::with_capacity(1 << 20, file);
+            match encoding {
+                Encoding::Plain => write_statements(out, receiver)?.flush()?,
+                Encoding::Gzip => {
+                    let gzip = GzEncoder::new(out, Compression::fast());
+                    write_statements(gzip, receiver)?.finish()?.flush()?
+                }
             }
-            out.write_all(FOOTER)?;
-            out.flush()?;
             Ok(())
         });
 
@@ -153,6 +158,38 @@ impl SqlFile {
         }
         written.context("writing the SQL file")
     }
+}
+
+/// How a `SqlFile` encodes what it writes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Encoding {
+    /// Plain SQL text.
+    Plain,
+    /// Gzipped SQL text, for a path that ends in `.gz`.
+    Gzip,
+}
+
+impl Encoding {
+    fn for_path(path: &Path) -> Self {
+        match path.extension() {
+            Some(extension) if extension.eq_ignore_ascii_case("gz") => Encoding::Gzip,
+            _ => Encoding::Plain,
+        }
+    }
+}
+
+/// Writes the header, every statement `receiver` gets, and the footer to `out`, and returns `out`
+/// for the caller to flush or finish.
+fn write_statements<W: io::Write>(
+    mut out: W,
+    mut receiver: mpsc::Receiver<Vec<u8>>,
+) -> io::Result<W> {
+    out.write_all(HEADER)?;
+    while let Some(statement) = receiver.blocking_recv() {
+        out.write_all(&statement)?;
+    }
+    out.write_all(FOOTER)?;
+    Ok(out)
 }
 
 /// Runs INSERT statements against a target database over one connection, inside one
@@ -226,6 +263,8 @@ impl Target {
 mod tests {
     use std::{env, process};
 
+    use flate2::read::GzDecoder;
+
     use super::*;
 
     /// Writes `statement` through a new `SqlFile` at `path` and finishes it with `outcome`.
@@ -254,6 +293,21 @@ mod tests {
             "{} should have been renamed",
             partial.display()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn sql_file_is_gzipped_when_its_path_ends_in_gz() -> Result<()> {
+        use std::io::Read;
+
+        let path = temp_path("gzip").with_extension("sql.gz");
+        write_one(&path, b"INSERT 1;\n", Outcome::Keep)?;
+
+        let mut written = Vec::new();
+        let decoded = GzDecoder::new(File::open(&path)?).read_to_end(&mut written);
+        fs::remove_file(&path)?;
+        decoded.context("reading the file back as gzip")?;
+        assert_eq!(written, [HEADER, b"INSERT 1;\n", FOOTER].concat());
         Ok(())
     }
 

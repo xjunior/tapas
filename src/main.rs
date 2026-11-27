@@ -35,7 +35,7 @@ struct Args {
     )]
     source: Option<String>,
 
-    /// SQL file to write the sample to.
+    /// SQL file to write the sample to. A path ending in .gz is gzipped as it's written.
     #[arg(long, short, required_unless_present_any = ["plan", "target"], conflicts_with = "target")]
     output: Option<PathBuf>,
 
