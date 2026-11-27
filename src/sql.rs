@@ -10,10 +10,24 @@ const BINARY_CHARSET: u16 = 63;
 /// The SQL literal for a missing value.
 pub const NULL: &[u8] = b"NULL";
 
+const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+
 /// Quotes a table or column name.
 #[must_use]
 pub fn identifier(name: &str) -> String {
     format!("`{}`", name.replace('`', "``"))
+}
+
+/// Appends `name` to `out`, quoted as a table or column name.
+fn push_identifier(out: &mut Vec<u8>, name: &str) {
+    out.push(b'`');
+    for &byte in name.as_bytes() {
+        if byte == b'`' {
+            out.push(b'`');
+        }
+        out.push(byte);
+    }
+    out.push(b'`');
 }
 
 /// How a column's values are written back as SQL.
@@ -88,8 +102,9 @@ pub fn literal(kind: Kind, value: Option<&[u8]>) -> Vec<u8> {
         Kind::Binary => {
             let mut out = Vec::with_capacity(bytes.len() * 2 + 3);
             out.extend_from_slice(b"X'");
-            for byte in bytes {
-                out.extend_from_slice(format!("{byte:02x}").as_bytes());
+            for &byte in bytes {
+                out.push(HEX_DIGITS[usize::from(byte >> 4)]);
+                out.push(HEX_DIGITS[usize::from(byte & 0x0f)]);
             }
             out.push(b'\'');
             out
@@ -146,7 +161,9 @@ pub fn sampler_queries(sampler: &Sampler, deps: &[Dep], chunk_size: usize) -> Ve
     for Dep { column, allowed } in deps {
         match allowed {
             Allowed::AnyValue => {
-                let condition = format!("{} IS NOT NULL", identifier(column)).into_bytes();
+                let mut condition = Vec::with_capacity(column.len() + 14);
+                push_identifier(&mut condition, column);
+                condition.extend_from_slice(b" IS NOT NULL");
                 for conditions in &mut combinations {
                     conditions.push(condition.clone());
                 }
@@ -179,7 +196,10 @@ pub fn sampler_queries(sampler: &Sampler, deps: &[Dep], chunk_size: usize) -> Ve
 
 #[must_use]
 fn in_list(column: &str, values: &[Vec<u8>]) -> Vec<u8> {
-    let mut out = format!("{} IN (", identifier(column)).into_bytes();
+    let value_bytes: usize = values.iter().map(|value| value.len() + 2).sum();
+    let mut out = Vec::with_capacity(column.len() + value_bytes + 8);
+    push_identifier(&mut out, column);
+    out.extend_from_slice(b" IN (");
     for (index, value) in values.iter().enumerate() {
         if index > 0 {
             out.extend_from_slice(b", ");
@@ -201,7 +221,8 @@ fn select(sampler: &Sampler, dep_conditions: Vec<Vec<u8>>) -> Vec<u8> {
     }
     conditions.extend(dep_conditions);
 
-    let mut sql = format!("SELECT * FROM {}", identifier(&sampler.table)).into_bytes();
+    let mut sql = b"SELECT * FROM ".to_vec();
+    push_identifier(&mut sql, &sampler.table);
     if !conditions.is_empty() {
         sql.extend_from_slice(b" WHERE ");
         sql.extend_from_slice(&conditions.join(&b" AND "[..]));
@@ -215,13 +236,24 @@ fn select(sampler: &Sampler, dep_conditions: Vec<Vec<u8>>) -> Vec<u8> {
 /// Builds one multi-row INSERT.
 #[must_use]
 pub fn insert(table: &str, columns: &[String], rows: &[Vec<Vec<u8>>]) -> Vec<u8> {
-    let names: Vec<String> = columns.iter().map(|name| identifier(name)).collect();
-    let mut out = format!(
-        "INSERT INTO {} ({}) VALUES\n",
-        identifier(table),
-        names.join(", ")
-    )
-    .into_bytes();
+    // Sized up front: a batch's statement is large, and growing it would copy it several times.
+    let header_bytes: usize =
+        table.len() + columns.iter().map(|name| name.len() + 4).sum::<usize>();
+    let row_bytes: usize = rows
+        .iter()
+        .map(|row| row.iter().map(|literal| literal.len() + 2).sum::<usize>() + 4)
+        .sum();
+    let mut out = Vec::with_capacity(header_bytes + row_bytes + 32);
+    out.extend_from_slice(b"INSERT INTO ");
+    push_identifier(&mut out, table);
+    out.extend_from_slice(b" (");
+    for (index, name) in columns.iter().enumerate() {
+        if index > 0 {
+            out.extend_from_slice(b", ");
+        }
+        push_identifier(&mut out, name);
+    }
+    out.extend_from_slice(b") VALUES\n");
     for (index, row) in rows.iter().enumerate() {
         out.extend_from_slice(if index == 0 { b"(" } else { b",\n(" });
         out.extend_from_slice(&row.join(&b", "[..]));
@@ -297,6 +329,36 @@ mod tests {
         assert_eq!(
             text(&literal(Kind::Text, Some(b"it's a\\b\n\r\0\x1a")))?,
             r"'it\'s a\\b\n\r\0\Z'"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn writes_every_byte_as_two_hex_digits() -> Result<(), Utf8Error> {
+        use std::fmt::Write;
+
+        let bytes: Vec<u8> = (0..=u8::MAX).collect();
+        let mut expected = String::from("X'");
+        for byte in &bytes {
+            write!(expected, "{byte:02x}").expect("writing to a String doesn't fail");
+        }
+        expected.push('\'');
+        assert_eq!(text(&literal(Kind::Binary, Some(&bytes)))?, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn quotes_names_in_every_statement() -> Result<(), Utf8Error> {
+        let deps = [dep("we`ird", values(&["1"]))];
+        let queries = sampler_queries(&sampler("ta`ble", None, None), &deps, 10);
+        assert_eq!(
+            text(&queries[0])?,
+            "SELECT * FROM `ta``ble` WHERE `we``ird` IN (1)"
+        );
+        let columns = ["we`ird".to_string()];
+        assert_eq!(
+            text(&insert("ta`ble", &columns, &[vec![b"1".to_vec()]]))?,
+            "INSERT INTO `ta``ble` (`we``ird`) VALUES\n(1);\n"
         );
         Ok(())
     }
