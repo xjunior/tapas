@@ -1,15 +1,18 @@
+//! Works out from the config which tables to extract, in which order, and what to remember of
+//! each table's rows while extracting.
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Result, bail};
 
 use crate::config::{ColumnRef, Config, Sampler};
 use crate::since::Since;
-use crate::sql::{self, Allowed};
+use crate::sql::{self, Allowed, Dep};
 
-/// What the extraction needs to know about one table.
-#[derive(Debug, Default)]
+/// Holds what the extraction needs to know about one table.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TablePlan {
-    /// Indexes into `Plan::samplers`.
+    /// The table's samplers, as indexes into `Plan::samplers`.
     pub samplers: Vec<usize>,
     /// Tables whose rows this table's samplers filter on.
     pub parents: BTreeSet<String>,
@@ -25,26 +28,32 @@ pub struct TablePlan {
     pub cycle: Option<usize>,
 }
 
-#[derive(Debug)]
+/// Holds every sampler, and what the extraction needs to know to run them in order.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Plan {
+    /// The configured samplers, followed by the ones `deps` pull in.
     pub samplers: Vec<Sampler>,
+    /// Every table some sampler extracts from, by name.
     pub tables: BTreeMap<String, TablePlan>,
     /// Tables in an order where each comes after its parents; tables in a cycle sit together.
     pub order: Vec<String>,
     /// Groups of tables that depend on each other. They're extracted together, in rounds.
     pub cycles: Vec<Vec<String>>,
-    /// Sampler name -> index into `samplers`.
+    /// Index into `samplers` of each named sampler, by name.
     pub named: BTreeMap<String, usize>,
     /// Columns whose values children read from a named sampler's own rows.
     pub named_keep: BTreeMap<String, BTreeSet<String>>,
+    /// How far back samplers with a `time_column` reach, when `--since` was given.
     pub since: Option<Since>,
 }
 
 impl Plan {
-    pub fn build(config: Config, since: Option<Since>) -> Result<Self> {
+    /// Plans the extraction of `config`'s samplers, limited by `since`. Fails when the samplers
+    /// contradict each other or depend on tables nothing extracts.
+    pub fn try_new(config: Config, since: Option<Since>) -> Result<Self> {
         let mut samplers = config.samplers;
         if let Some(since) = since {
-            for sampler in samplers.iter_mut() {
+            for sampler in &mut samplers {
                 sampler.time_filter = since.condition(&sampler.time_column);
             }
         }
@@ -102,12 +111,12 @@ impl Plan {
                 };
                 tables
                     .get_mut(&parent_table)
-                    .unwrap()
+                    .expect("every sampler's table, named or not, has a plan")
                     .children
                     .insert(sampler.table.clone());
                 tables
                     .get_mut(&sampler.table)
-                    .unwrap()
+                    .expect("every sampler's table has a plan")
                     .parents
                     .insert(parent_table);
             }
@@ -116,7 +125,10 @@ impl Plan {
         let (order, cycles) = components(&tables);
         for (index, cycle) in cycles.iter().enumerate() {
             for name in cycle {
-                tables.get_mut(name).unwrap().cycle = Some(index);
+                tables
+                    .get_mut(name)
+                    .expect("components only returns planned tables")
+                    .cycle = Some(index);
             }
         }
         for table in tables.values_mut() {
@@ -133,20 +145,28 @@ impl Plan {
             since,
         };
         for (index, sampler) in plan.samplers.iter().enumerate() {
-            if plan.loops(index) && sampler.limit.is_some() {
+            if let Some(cycle) = plan.tables[&sampler.table].cycle
+                && sampler.limit.is_some()
+                && plan.loops(index)
+            {
                 bail!(
                     "{}: limit can't be used on a sampler that depends on its own cycle ({}), \
                      because it runs in rounds",
                     sampler.origin,
-                    plan.cycles[plan.tables[&sampler.table].cycle.unwrap()].join(", ")
+                    plan.cycles[cycle].join(", ")
                 );
             }
         }
         Ok(plan)
     }
 
-    /// The deps of sampler `index` whose parent is in the sampler's own cycle and doesn't keep
-    /// every row. Those values grow while the cycle runs.
+    /// Returns the deps of sampler `index` whose parent is in the sampler's own cycle and doesn't
+    /// keep every row. Those values grow while the cycle runs.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` isn't a sampler of this plan.
+    #[must_use]
     pub fn cycle_deps(&self, index: usize) -> Vec<&str> {
         let sampler = &self.samplers[index];
         let Some(cycle) = self.tables[&sampler.table].cycle else {
@@ -163,7 +183,8 @@ impl Plan {
             .collect()
     }
 
-    /// The table a dep reads from: the one it names, or the named sampler's table.
+    /// Returns the table a dep reads from: the one it names, or the named sampler's table.
+    #[must_use]
     pub fn parent_table<'a>(&'a self, parent: &'a ColumnRef) -> &'a str {
         match self.named.get(&parent.table) {
             Some(&index) => &self.samplers[index].table,
@@ -171,7 +192,13 @@ impl Plan {
         }
     }
 
-    /// A dep on rows that include every row of the parent allows any non-NULL value.
+    /// Returns whether a dep may hold any non-NULL value, because the rows it reads from include
+    /// every row of the parent.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `parent` names neither a table nor a named sampler of this plan.
+    #[must_use]
     pub fn allows_any(&self, parent: &ColumnRef) -> bool {
         match self.named.get(&parent.table) {
             Some(&index) => self.samplers[index].is_full(),
@@ -179,13 +206,19 @@ impl Plan {
         }
     }
 
-    /// Sampler `index` runs in rounds until its cycle stops growing.
+    /// Returns whether sampler `index` runs in rounds until its cycle stops growing.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` isn't a sampler of this plan.
+    #[must_use]
     pub fn loops(&self, index: usize) -> bool {
         !self.cycle_deps(index).is_empty()
     }
 
-    /// Samplers with a `time_column` only run once `--since` says how far back to go, so a
-    /// forgotten flag can't quietly copy whole tables.
+    /// Fails unless `--since` was given or no sampler has a `time_column`. Samplers with a
+    /// `time_column` only run once `--since` says how far back to go, so a forgotten flag can't
+    /// quietly copy whole tables.
     pub fn check_since(&self) -> Result<()> {
         if self.since.is_some() {
             return Ok(());
@@ -206,33 +239,38 @@ impl Plan {
         Ok(())
     }
 
-    /// What `--plan` prints: each table in run order, with the queries its samplers will run.
+    /// Returns what `--plan` prints: each table in run order, with the queries its samplers will
+    /// run.
+    #[must_use]
     pub fn describe(&self) -> String {
         let timed = self
             .samplers
             .iter()
-            .filter(|s| !s.time_column.is_empty())
+            .filter(|sampler| !sampler.time_column.is_empty())
             .count();
         let limited = self
             .samplers
             .iter()
-            .filter(|s| s.time_filter.is_some())
+            .filter(|sampler| sampler.time_filter.is_some())
             .count();
         let mut out = format!(
             "{} tables, {} samplers, {timed} with a time_column\n",
             self.tables.len(),
             self.samplers.len()
         );
-        out.push_str(&match self.since {
-            None if timed > 0 => "--since: not given, so a run would refuse to start\n".into(),
-            None => "--since: not needed\n".into(),
-            Some(Since::Ever) => "--since ever: time_column ignored, every row kept\n".into(),
-            Some(since) => format!("--since {since}: limits {limited} samplers\n"),
-        });
+        let since_line: String = match self.since {
+            None if timed > 0 => "--since: not given, so a run would refuse to start\n".to_string(),
+            None => "--since: not needed\n".to_string(),
+            Some(Since::Ever) => "--since ever: time_column ignored, every row kept\n".to_string(),
+            Some(since @ Since::Back { .. }) => {
+                format!("--since {since}: limits {limited} samplers\n")
+            }
+        };
+        out.push_str(&since_line);
 
         for name in &self.order {
             let table = &self.tables[name];
-            let mut notes = Vec::new();
+            let mut notes: Vec<String> = Vec::new();
             if let Some(cycle) = table.cycle {
                 notes.push(format!("cycle: {}", self.cycles[cycle].join(", ")));
             }
@@ -243,7 +281,7 @@ impl Plan {
                 notes.push(format!("keeps {}", join(&table.keep)));
             }
             if table.full {
-                notes.push("every row".into());
+                notes.push("every row".to_string());
             }
             out.push_str(&format!("\n{name}"));
             if !notes.is_empty() {
@@ -253,7 +291,7 @@ impl Plan {
 
             for &index in &table.samplers {
                 let sampler = &self.samplers[index];
-                let deps: Vec<(String, Allowed)> = sampler
+                let deps: Vec<Dep> = sampler
                     .of
                     .iter()
                     .map(|(column, parent)| {
@@ -262,9 +300,13 @@ impl Plan {
                         } else {
                             Allowed::Values(vec![format!("<{parent}>").into_bytes()])
                         };
-                        (column.clone(), allowed)
+                        Dep {
+                            column: column.clone(),
+                            allowed,
+                        }
                     })
                     .collect();
+                // Every dep allows one placeholder value, so there's exactly one query.
                 let mut query = sql::sampler_queries(sampler, &deps, 1).remove(0);
                 if let Some(limit) = sampler.limit {
                     query.extend_from_slice(format!(" LIMIT {limit}").as_bytes());
@@ -290,11 +332,14 @@ impl Plan {
 /// Deps belong to the table, so the pulled rows include those pointed at by rows other samplers
 /// (pulls included) brought in. A parent that keeps every row needs no pull.
 fn pull_referenced_rows(samplers: &mut Vec<Sampler>) -> Result<()> {
-    let names: BTreeSet<&str> = samplers.iter().filter_map(|s| s.name.as_deref()).collect();
+    let names: BTreeSet<&str> = samplers
+        .iter()
+        .filter_map(|sampler| sampler.name.as_deref())
+        .collect();
     let full: BTreeSet<&str> = samplers
         .iter()
-        .filter(|s| s.is_full())
-        .map(|s| s.table.as_str())
+        .filter(|sampler| sampler.is_full())
+        .map(|sampler| sampler.table.as_str())
         .collect();
 
     // (child table, child column) -> (parent table, parent column), each once.
@@ -329,32 +374,25 @@ fn pull_referenced_rows(samplers: &mut Vec<Sampler>) -> Result<()> {
         .map(|((table, column), (parent, _))| Sampler {
             origin: format!("pulled in by {table}.{column}"),
             table: parent.table,
-            name: None,
-            filter: None,
-            order_by: None,
-            limit: None,
             of: BTreeMap::from([(parent.column, ColumnRef { table, column })]),
-            deps: BTreeMap::new(),
-            time_column: Vec::new(),
-            time_filter: None,
+            ..Sampler::default()
         })
         .collect();
     samplers.extend(pulls);
     Ok(())
 }
 
+#[must_use]
 fn join(names: &BTreeSet<String>) -> String {
-    names
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .join(", ")
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    names.join(", ")
 }
 
 /// Groups tables into strongly connected components with Tarjan's algorithm. Returns the tables
 /// in an order where every table comes after the tables it depends on (members of a cycle sit
 /// together, by name), and the cycles: components of several tables, or of one that depends on
 /// itself.
+#[must_use]
 fn components(tables: &BTreeMap<String, TablePlan>) -> (Vec<String>, Vec<Vec<String>>) {
     struct Tarjan<'a> {
         tables: &'a BTreeMap<String, TablePlan>,
@@ -389,7 +427,10 @@ fn components(tables: &BTreeMap<String, TablePlan>) -> (Vec<String>, Vec<Vec<Str
             if self.low[name] == self.index[name] {
                 let mut component = Vec::new();
                 loop {
-                    let member = self.stack.pop().unwrap();
+                    let member = self
+                        .stack
+                        .pop()
+                        .expect("`name` is on the stack until its component is popped");
                     self.on_stack.remove(member);
                     component.push(member);
                     if member == name {
@@ -436,11 +477,24 @@ mod tests {
     use super::*;
 
     fn plan(yaml: &str) -> Result<Plan> {
-        Plan::build(Config::parse(yaml)?, None)
+        let config: Config = yaml.parse()?;
+        Plan::try_new(config, None)
     }
 
-    fn plan_since(yaml: &str, since: &str) -> Plan {
-        Plan::build(Config::parse(yaml).unwrap(), Some(since.parse().unwrap())).unwrap()
+    fn plan_since(yaml: &str, since: &str) -> Result<Plan> {
+        let config: Config = yaml.parse()?;
+        let since: Since = since.parse().map_err(anyhow::Error::msg)?;
+        Plan::try_new(config, Some(since))
+    }
+
+    /// Returns where `table` sits in the plan's run order.
+    fn position(plan: &Plan, table: &str) -> Result<usize> {
+        use anyhow::Context;
+
+        plan.order
+            .iter()
+            .position(|name| name == table)
+            .with_context(|| format!("{table} isn't in the run order"))
     }
 
     const TIMED: &str = r#"
@@ -457,8 +511,8 @@ samplers:
 "#;
 
     #[test]
-    fn applies_since_to_samplers_with_a_time_column() {
-        let plan = plan_since(TIMED, "2 weeks");
+    fn applies_since_to_samplers_with_a_time_column() -> Result<()> {
+        let plan = plan_since(TIMED, "2 weeks")?;
         assert_eq!(plan.samplers[0].time_filter, None);
         assert_eq!(
             plan.samplers[1].time_filter.as_deref(),
@@ -470,40 +524,54 @@ samplers:
             plan.samplers[2].time_filter.as_deref(),
             Some("`created_at` >= CURDATE() - INTERVAL 2 WEEK")
         );
-        assert!(plan.check_since().is_ok());
+        plan.check_since()
     }
 
     #[test]
-    fn a_time_limited_table_is_not_full() {
+    fn a_time_limited_table_is_not_full() -> Result<()> {
         let yaml = "samplers:\n  - table: events\n    time_column: created_at\n";
-        assert!(!plan_since(yaml, "1 week").tables["events"].full);
-        assert!(plan_since(yaml, "ever").tables["events"].full);
-    }
-
-    #[test]
-    fn since_ever_keeps_every_row() {
-        let plan = plan_since(TIMED, "ever");
         assert!(
-            plan.samplers
-                .iter()
-                .all(|sampler| sampler.time_filter.is_none())
+            !plan_since(yaml, "1 week")?.tables["events"].full,
+            "--since 1 week drops older events"
         );
-        assert!(plan.check_since().is_ok());
+        assert!(
+            plan_since(yaml, "ever")?.tables["events"].full,
+            "--since ever keeps every event"
+        );
+        Ok(())
     }
 
     #[test]
-    fn requires_since_when_a_sampler_has_a_time_column() {
-        let error = plan(TIMED).unwrap().check_since().unwrap_err().to_string();
+    fn since_ever_keeps_every_row() -> Result<()> {
+        let plan = plan_since(TIMED, "ever")?;
+        let filters: Vec<Option<&str>> = plan
+            .samplers
+            .iter()
+            .map(|sampler| sampler.time_filter.as_deref())
+            .collect();
+        assert!(
+            filters.iter().all(|filter| filter.is_none()),
+            "--since ever needs no time filter: {filters:?}"
+        );
+        plan.check_since()
+    }
+
+    #[test]
+    fn requires_since_when_a_sampler_has_a_time_column() -> Result<()> {
+        let error = plan(TIMED)?
+            .check_since()
+            .expect_err("TIMED has time columns and no --since")
+            .to_string();
         assert!(error.contains("2 sampler(s) have a time_column"), "{error}");
         assert!(error.contains("config sampler #2 (users)"), "{error}");
         assert!(error.contains("--since ever"), "{error}");
 
-        assert!(plan(SHOP).unwrap().check_since().is_ok());
+        plan(SHOP)?.check_since()
     }
 
     #[test]
-    fn describes_the_plan() {
-        let described = plan_since(TIMED, "2 weeks").describe();
+    fn describes_the_plan() -> Result<()> {
+        let described = plan_since(TIMED, "2 weeks")?.describe();
         assert!(
             described.contains("3 tables, 3 samplers, 2 with a time_column"),
             "{described}"
@@ -528,8 +596,9 @@ samplers:
             "{described}"
         );
 
-        let unset = plan(TIMED).unwrap().describe();
+        let unset = plan(TIMED)?.describe();
         assert!(unset.contains("a run would refuse to start"), "{unset}");
+        Ok(())
     }
 
     const SHOP: &str = r#"
@@ -554,20 +623,28 @@ samplers:
 "#;
 
     #[test]
-    fn orders_parents_before_children() {
-        let plan = plan(SHOP).unwrap();
-        let position = |table: &str| plan.order.iter().position(|t| t == table).unwrap();
+    fn orders_parents_before_children() -> Result<()> {
+        let plan = plan(SHOP)?;
 
         assert_eq!(plan.order.len(), 5);
-        assert!(position("countries") < position("users"));
-        assert!(position("users") < position("phones"));
-        assert!(position("users") < position("orders"));
-        assert!(position("orders") < position("line_items"));
+        for (parent, child) in [
+            ("countries", "users"),
+            ("users", "phones"),
+            ("users", "orders"),
+            ("orders", "line_items"),
+        ] {
+            assert!(
+                position(&plan, parent)? < position(&plan, child)?,
+                "{parent} must run before {child}: {:?}",
+                plan.order
+            );
+        }
+        Ok(())
     }
 
     #[test]
-    fn tracks_kept_columns_full_tables_and_dedupe() {
-        let plan = plan(SHOP).unwrap();
+    fn tracks_kept_columns_full_tables_and_dedupe() -> Result<()> {
+        let plan = plan(SHOP)?;
 
         assert_eq!(
             plan.tables["users"].keep,
@@ -577,19 +654,36 @@ samplers:
             plan.tables["orders"].keep,
             BTreeSet::from(["id".to_string()])
         );
-        assert!(plan.tables["phones"].keep.is_empty());
+        assert!(
+            plan.tables["phones"].keep.is_empty(),
+            "nothing depends on phones, yet it keeps {:?}",
+            plan.tables["phones"].keep
+        );
 
-        assert!(plan.tables["countries"].full);
-        assert!(!plan.tables["users"].full);
+        assert!(
+            plan.tables["countries"].full,
+            "countries' only sampler keeps every row"
+        );
+        assert!(
+            !plan.tables["users"].full,
+            "neither users sampler keeps every row"
+        );
 
-        assert!(plan.tables["users"].dedupe);
-        assert!(!plan.tables["orders"].dedupe);
+        assert!(
+            plan.tables["users"].dedupe,
+            "users has two samplers that can return the same row"
+        );
+        assert!(
+            !plan.tables["orders"].dedupe,
+            "orders has one sampler and no cycle"
+        );
+        Ok(())
     }
 
     #[test]
     fn rejects_missing_parents() {
-        let error =
-            plan("samplers:\n  - table: phones\n    of:\n      user_id: users.id\n").unwrap_err();
+        let error = plan("samplers:\n  - table: phones\n    of:\n      user_id: users.id\n")
+            .expect_err("no sampler extracts users");
         assert!(
             error.to_string().contains("no sampler extracts users"),
             "{error}"
@@ -617,42 +711,64 @@ samplers:
 "#;
 
     #[test]
-    fn groups_tables_that_depend_on_each_other() {
-        let plan = plan_since(PROJECTS, "2 weeks");
-        let position = |table: &str| plan.order.iter().position(|t| t == table).unwrap();
+    fn groups_tables_that_depend_on_each_other() -> Result<()> {
+        let plan = plan_since(PROJECTS, "2 weeks")?;
 
         assert_eq!(plan.cycles, [["project_tasks", "projects"]]);
         assert_eq!(plan.tables["projects"].cycle, Some(0));
         assert_eq!(plan.tables["project_tasks"].cycle, Some(0));
         assert_eq!(plan.tables["users"].cycle, None);
-        assert!(plan.tables["project_tasks"].dedupe);
+        assert!(
+            plan.tables["project_tasks"].dedupe,
+            "a table in a cycle can return the same row in several rounds"
+        );
 
-        assert!(position("users") < position("projects"));
-        assert!(position("project_tasks") < position("task_notes"));
-        assert!(position("projects") < position("task_notes"));
+        for (parent, child) in [
+            ("users", "projects"),
+            ("project_tasks", "task_notes"),
+            ("projects", "task_notes"),
+        ] {
+            assert!(
+                position(&plan, parent)? < position(&plan, child)?,
+                "{parent} must run before {child}: {:?}",
+                plan.order
+            );
+        }
+        Ok(())
     }
 
     #[test]
-    fn knows_which_samplers_run_in_rounds() {
-        let plan = plan_since(PROJECTS, "2 weeks");
+    fn knows_which_samplers_run_in_rounds() -> Result<()> {
+        let plan = plan_since(PROJECTS, "2 weeks")?;
         assert!(!plan.loops(1), "the timed project_tasks sampler is a seed");
-        assert!(plan.loops(2));
-        assert!(plan.loops(3));
+        assert!(
+            plan.loops(2),
+            "projects depends on project_tasks in its cycle"
+        );
+        assert!(
+            plan.loops(3),
+            "project_tasks depends on projects in its cycle"
+        );
         assert!(!plan.loops(4), "task_notes isn't in the cycle");
         assert_eq!(plan.cycle_deps(5), ["id"], "users.id is outside the cycle");
+        Ok(())
     }
 
     #[test]
-    fn a_cycle_needs_no_rounds_when_since_keeps_everything() {
+    fn a_cycle_needs_no_rounds_when_since_keeps_everything() -> Result<()> {
         // The timed project_tasks sampler keeps every row, so deps on project_tasks need no values.
-        let plan = plan_since(PROJECTS, "ever");
-        assert!(plan.tables["project_tasks"].full);
-        assert!(!plan.loops(2));
+        let plan = plan_since(PROJECTS, "ever")?;
+        assert!(
+            plan.tables["project_tasks"].full,
+            "--since ever makes the timed project_tasks sampler keep every row"
+        );
+        assert!(!plan.loops(2), "projects' only cycle dep allows any value");
         assert!(plan.loops(3), "projects still isn't full");
+        Ok(())
     }
 
     #[test]
-    fn plans_self_references() {
+    fn plans_self_references() -> Result<()> {
         let plan = plan(
             r#"
 samplers:
@@ -662,15 +778,18 @@ samplers:
     of:
       id: employees.manager_id
 "#,
-        )
-        .unwrap();
+        )?;
         assert_eq!(plan.cycles, [["employees"]]);
-        assert!(!plan.loops(0));
-        assert!(plan.loops(1));
+        assert!(!plan.loops(0), "the first sampler has no deps");
+        assert!(
+            plan.loops(1),
+            "managers of extracted employees are extracted in rounds"
+        );
+        Ok(())
     }
 
     #[test]
-    fn a_dep_on_a_full_table_in_the_cycle_does_not_loop() {
+    fn a_dep_on_a_full_table_in_the_cycle_does_not_loop() -> Result<()> {
         let plan = plan(
             r#"
 samplers:
@@ -679,10 +798,13 @@ samplers:
     of:
       parent_id: categories.id
 "#,
-        )
-        .unwrap();
+        )?;
         assert_eq!(plan.cycles, [["categories"]]);
-        assert!(!plan.loops(1));
+        assert!(
+            !plan.loops(1),
+            "every category is extracted, so any parent_id is fine"
+        );
+        Ok(())
     }
 
     #[test]
@@ -698,14 +820,14 @@ samplers:
       id: employees.manager_id
 "#,
         )
-        .unwrap_err();
+        .expect_err("the second sampler loops and has a limit");
         assert!(error.to_string().contains("limit can't be used"), "{error}");
         assert!(error.to_string().contains("sampler #2"), "{error}");
     }
 
     #[test]
-    fn describes_cycles() {
-        let described = plan_since(PROJECTS, "2 weeks").describe();
+    fn describes_cycles() -> Result<()> {
+        let described = plan_since(PROJECTS, "2 weeks")?.describe();
         assert!(
             described.contains("projects  (cycle: project_tasks, projects;"),
             "{described}"
@@ -714,6 +836,7 @@ samplers:
             described.contains("sampler #3 (projects)  (in rounds)"),
             "{described}"
         );
+        Ok(())
     }
 
     const WRITE_OFFS: &str = r#"
@@ -728,15 +851,22 @@ samplers:
 "#;
 
     #[test]
-    fn deps_can_name_a_sampler() {
-        let plan = plan_since(WRITE_OFFS, "2 weeks");
+    fn deps_can_name_a_sampler() -> Result<()> {
+        let plan = plan_since(WRITE_OFFS, "2 weeks")?;
         assert_eq!(plan.named["recent_write_offs"], 1);
         assert_eq!(
             plan.named_keep["recent_write_offs"],
             BTreeSet::from(["project_id".to_string()])
         );
-        assert!(plan.tables["written_off_projects"].keep.is_empty());
-        assert!(plan.tables["written_off_projects"].full);
+        assert!(
+            plan.tables["written_off_projects"].keep.is_empty(),
+            "the named sampler keeps the values, not the table: {:?}",
+            plan.tables["written_off_projects"].keep
+        );
+        assert!(
+            plan.tables["written_off_projects"].full,
+            "the unnamed sampler keeps every write-off"
+        );
         assert_eq!(
             plan.tables["projects"].parents,
             BTreeSet::from(["written_off_projects".to_string()])
@@ -745,29 +875,40 @@ samplers:
         // The table keeps every row, but the named sampler doesn't, so its values matter.
         let parent = &plan.samplers[2].of["id"];
         assert_eq!(plan.parent_table(parent), "written_off_projects");
-        assert!(!plan.allows_any(parent));
         assert!(
-            plan.describe()
-                .contains("`id` IN (<recent_write_offs.project_id>)"),
-            "{}",
-            plan.describe()
+            !plan.allows_any(parent),
+            "recent_write_offs only keeps recent rows"
         );
+        let described = plan.describe();
+        assert!(
+            described.contains("`id` IN (<recent_write_offs.project_id>)"),
+            "{described}"
+        );
+        Ok(())
     }
 
     #[test]
-    fn a_named_sampler_that_keeps_everything_allows_any_value() {
-        let plan = plan_since(WRITE_OFFS, "ever");
-        assert!(plan.allows_any(&plan.samplers[2].of["id"]));
+    fn a_named_sampler_that_keeps_everything_allows_any_value() -> Result<()> {
+        let plan = plan_since(WRITE_OFFS, "ever")?;
+        assert!(
+            plan.allows_any(&plan.samplers[2].of["id"]),
+            "--since ever makes recent_write_offs keep every row"
+        );
+        Ok(())
     }
 
     #[test]
     fn rejects_bad_names() {
         let clash = "samplers:\n  - table: users\n  - table: orders\n    name: users\n";
-        let error = plan(clash).unwrap_err().to_string();
+        let error = plan(clash)
+            .expect_err("a sampler can't be named after a table")
+            .to_string();
         assert!(error.contains("name `users` is also a table"), "{error}");
 
         let twice = "samplers:\n  - table: users\n    name: a\n  - table: orders\n    name: a\n";
-        let error = plan(twice).unwrap_err().to_string();
+        let error = plan(twice)
+            .expect_err("two samplers can't share a name")
+            .to_string();
         assert!(error.contains("name `a` is already used"), "{error}");
     }
 
@@ -788,14 +929,14 @@ samplers:
 "#;
 
     #[test]
-    fn deps_pull_in_the_rows_they_point_at() {
-        let plan = plan_since(REFERENCES, "2 weeks");
+    fn deps_pull_in_the_rows_they_point_at() -> Result<()> {
+        let plan = plan_since(REFERENCES, "2 weeks")?;
 
         // users: its own sampler, plus one for the users the orders point at.
         let users: Vec<&Sampler> = plan.tables["users"]
             .samplers
             .iter()
-            .map(|&i| &plan.samplers[i])
+            .map(|&index| &plan.samplers[index])
             .collect();
         assert_eq!(users.len(), 2);
         assert_eq!(users[0].filter.as_deref(), Some("age > 25"));
@@ -808,51 +949,74 @@ samplers:
 
         // orders: only its time window; it runs before the users it points at.
         let orders = &plan.samplers[plan.tables["orders"].samplers[0]];
-        assert!(orders.of.is_empty());
-        assert!(orders.time_filter.is_some());
+        assert!(
+            orders.of.is_empty(),
+            "deps don't narrow the orders sampler: {:?}",
+            orders.of
+        );
+        assert!(
+            orders.time_filter.is_some(),
+            "orders has a time_column and --since is given"
+        );
         assert_eq!(
             plan.tables["orders"].keep,
             BTreeSet::from(["user_id".to_string()])
         );
-        let position = |table: &str| plan.order.iter().position(|t| t == table).unwrap();
-        assert!(position("orders") < position("users"));
+        assert!(
+            position(&plan, "orders")? < position(&plan, "users")?,
+            "orders must run before the users they pull in: {:?}",
+            plan.order
+        );
 
         // territories keeps every row, so nothing needs pulling there.
         assert_eq!(plan.tables["territories"].samplers.len(), 1);
-        assert!(plan.cycles.is_empty());
+        assert!(
+            plan.cycles.is_empty(),
+            "nothing depends on itself: {:?}",
+            plan.cycles
+        );
+        Ok(())
     }
 
     #[test]
-    fn a_referenced_table_needs_no_sampler_of_its_own() {
+    fn a_referenced_table_needs_no_sampler_of_its_own() -> Result<()> {
         let plan = plan_since(
             "samplers:\n  - table: orders\n    time_column: created_at\n    deps:\n      user_id: users.id\n",
             "1 week",
-        );
+        )?;
         assert_eq!(plan.tables["users"].samplers.len(), 1);
-        assert!(!plan.tables["users"].full);
+        assert!(
+            !plan.tables["users"].full,
+            "the pulled users sampler only keeps users that orders point at"
+        );
+        Ok(())
     }
 
     #[test]
-    fn deps_on_a_table_that_points_at_itself_form_a_cycle() {
+    fn deps_on_a_table_that_points_at_itself_form_a_cycle() -> Result<()> {
         let plan = plan(
             "samplers:\n  - table: employees\n    where: id = 40\n    deps:\n      manager_id: employees.id\n",
-        )
-        .unwrap();
+        )?;
         assert_eq!(plan.cycles, [["employees"]]);
         assert!(
             plan.loops(1),
             "the pull follows managers of pulled managers"
         );
+        Ok(())
     }
 
     #[test]
     fn rejects_deps_on_sampler_names_and_conflicting_deps() {
         let named = "samplers:\n  - table: users\n    name: adults\n  - table: orders\n    deps:\n      user_id: adults.id\n";
-        let error = plan(named).unwrap_err().to_string();
+        let error = plan(named)
+            .expect_err("deps can't point at a sampler name")
+            .to_string();
         assert!(error.contains("Use `of`"), "{error}");
 
         let conflict = "samplers:\n  - table: orders\n    deps:\n      user_id: users.id\n  - table: orders\n    where: total > 0\n    deps:\n      user_id: people.id\n";
-        let error = plan(conflict).unwrap_err().to_string();
+        let error = plan(conflict)
+            .expect_err("orders.user_id can't point at two tables")
+            .to_string();
         assert!(
             error.contains("orders.user_id points at people.id"),
             "{error}"

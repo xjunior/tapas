@@ -1,23 +1,25 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+//! Runs a plan's samplers against the source and streams their rows out as INSERT statements.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::mem;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
-use futures_util::StreamExt;
-use mysql_async::prelude::Queryable;
 use mysql_async::{Pool, Row, Value};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
-use xxhash_rust::xxh3::xxh3_128;
+use xxhash_rust::xxh3;
 
 use crate::plan::Plan;
-use crate::sql::{self, Allowed, Kind};
+use crate::sql::{self, Allowed, Dep, Kind};
 
-#[derive(Debug, Clone)]
+/// How the extraction splits its queries and statements.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Options {
-    /// Values per `IN (...)` list.
+    /// Each `IN (...)` list holds at most this many values. It must be at least 1.
     pub chunk_size: usize,
-    /// Rows per INSERT statement.
+    /// Each INSERT statement holds at most this many rows.
     pub batch_rows: usize,
 }
 
@@ -32,7 +34,7 @@ impl Default for Options {
 
 /// The distinct values of one kept column, in the order they were found, so a cycle can ask for
 /// just the values found since its last round.
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 struct KeySet {
     seen: HashSet<Vec<u8>>,
     order: Vec<Vec<u8>>,
@@ -47,15 +49,38 @@ impl KeySet {
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 struct TableState {
-    /// Kept column -> literals of the values extracted so far.
+    /// Literals of the values extracted so far, per kept column.
     keys: BTreeMap<String, KeySet>,
     /// Hashes of rows written so far, for tables with more than one sampler.
     seen: HashSet<u128>,
     rows: u64,
 }
 
+impl TableState {
+    /// Starts with no rows, keeping the values of `columns`.
+    #[must_use]
+    fn new_with_keys(columns: &BTreeSet<String>) -> Self {
+        let keys: BTreeMap<String, KeySet> = columns
+            .iter()
+            .map(|column| (column.clone(), KeySet::default()))
+            .collect();
+        Self {
+            keys,
+            ..Self::default()
+        }
+    }
+}
+
+fn lock(state: &Mutex<TableState>) -> MutexGuard<'_, TableState> {
+    state
+        .lock()
+        .expect("no task panics while it holds a table's state")
+}
+
+// Shared through an `Arc` because every sampler and query runs in its own spawned task, which
+// can't borrow from `extract`.
 struct Shared {
     plan: Plan,
     pool: Pool,
@@ -69,45 +94,30 @@ struct Shared {
 
 /// Extracts every sampler's rows, sending INSERT statements to `output`. Returns the number of
 /// rows written per table.
+///
+/// # Panics
+///
+/// Panics if `options.chunk_size` is 0.
 pub async fn extract(
     plan: Plan,
     pool: Pool,
     options: Options,
     output: mpsc::Sender<Vec<u8>>,
 ) -> Result<BTreeMap<String, u64>> {
-    let tables = plan
+    let tables: HashMap<String, Mutex<TableState>> = plan
         .tables
         .iter()
         .map(|(name, table)| {
-            let keys = table
-                .keep
-                .iter()
-                .map(|column| (column.clone(), KeySet::default()))
-                .collect();
-            (
-                name.clone(),
-                Mutex::new(TableState {
-                    keys,
-                    ..Default::default()
-                }),
-            )
+            let state = TableState::new_with_keys(&table.keep);
+            (name.clone(), Mutex::new(state))
         })
         .collect();
-    let named = plan
+    let named: HashMap<String, Mutex<TableState>> = plan
         .named_keep
         .iter()
         .map(|(name, columns)| {
-            let keys = columns
-                .iter()
-                .map(|column| (column.clone(), KeySet::default()))
-                .collect();
-            (
-                name.clone(),
-                Mutex::new(TableState {
-                    keys,
-                    ..Default::default()
-                }),
-            )
+            let state = TableState::new_with_keys(columns);
+            (name.clone(), Mutex::new(state))
         })
         .collect();
     let context = Arc::new(Shared {
@@ -126,7 +136,7 @@ pub async fn extract(
         .iter()
         .map(|(name, table)| (name.as_str(), table.samplers.len()))
         .collect();
-    let mut done: HashSet<String> = HashSet::new();
+    let mut done: HashSet<&str> = HashSet::new();
     let mut started = Started {
         samplers: vec![false; context.plan.samplers.len()],
         cycles: vec![false; context.plan.cycles.len()],
@@ -136,20 +146,25 @@ pub async fn extract(
     start_ready(&context, &done, &mut started, &mut running);
 
     while let Some(finished) = running.join_next().await {
-        let finished_tables: Vec<String> = match finished.context("extraction task panicked")?? {
+        let finished_tables: Vec<&str> = match finished.context("extraction task panicked")?? {
             Unit::Sampler(index) => {
                 let table = context.plan.samplers[index].table.as_str();
-                let left = samplers_left.get_mut(table).unwrap();
+                let left = samplers_left
+                    .get_mut(table)
+                    .expect("every sampler's table has a count of samplers left");
                 *left -= 1;
                 if *left > 0 {
                     continue;
                 }
-                vec![table.to_string()]
+                vec![table]
             }
-            Unit::Cycle(cycle) => context.plan.cycles[cycle].clone(),
+            Unit::Cycle(cycle) => context.plan.cycles[cycle]
+                .iter()
+                .map(String::as_str)
+                .collect(),
         };
         for table in finished_tables {
-            let rows = context.tables[&table].lock().unwrap().rows;
+            let rows = lock(&context.tables[table]).rows;
             log(&context, &format!("{table}: done, {rows} rows"));
             done.insert(table);
         }
@@ -158,17 +173,22 @@ pub async fn extract(
 
     let mut rows = BTreeMap::new();
     for (name, state) in &context.tables {
-        rows.insert(name.clone(), state.lock().unwrap().rows);
+        rows.insert(name.clone(), lock(state).rows);
     }
     Ok(rows)
 }
 
 /// What a finished task extracted: one sampler, or a whole cycle of tables.
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum Unit {
+    /// The sampler at this index of `Plan::samplers`.
     Sampler(usize),
+    /// The cycle at this index of `Plan::cycles`.
     Cycle(usize),
 }
 
+/// Which samplers and cycles have a task, by index into `Plan::samplers` and `Plan::cycles`.
+#[derive(Debug, Clone)]
 struct Started {
     samplers: Vec<bool>,
     cycles: Vec<bool>,
@@ -176,7 +196,7 @@ struct Started {
 
 fn start_ready(
     context: &Arc<Shared>,
-    done: &HashSet<String>,
+    done: &HashSet<&str>,
     started: &mut Started,
     running: &mut JoinSet<Result<Unit>>,
 ) {
@@ -208,7 +228,7 @@ fn start_ready(
             plan.tables[table]
                 .parents
                 .iter()
-                .all(|parent| members.contains(parent) || done.contains(parent))
+                .all(|parent| members.contains(parent) || done.contains(parent.as_str()))
         });
         if started.cycles[cycle] || !ready {
             continue;
@@ -286,21 +306,23 @@ async fn run_cycle(context: &Arc<Shared>, cycle: usize) -> Result<()> {
     }
 }
 
+#[must_use]
 fn cycle_rows(context: &Shared, members: &[String]) -> u64 {
     members
         .iter()
-        .map(|table| context.tables[table].lock().unwrap().rows)
+        .map(|table| lock(&context.tables[table]).rows)
         .sum()
 }
 
-/// The values each dep of sampler `index` allows right now. With `cursors`, a sampler with a
-/// single dep inside its cycle only gets the values found since its previous round; one with
-/// several gets them all, since a new row can come from any combination.
+/// Returns the values each dep of sampler `index` allows right now. With `cursors`, a sampler
+/// with a single dep inside its cycle only gets the values found since its previous round; one
+/// with several gets them all, since a new row can come from any combination.
+#[must_use]
 fn current_deps(
     context: &Shared,
     index: usize,
     cursors: Option<&mut HashMap<usize, usize>>,
-) -> Vec<(String, Allowed)> {
+) -> Vec<Dep> {
     let plan = &context.plan;
     let sampler = &plan.samplers[index];
     let cycle_deps = plan.cycle_deps(index);
@@ -310,31 +332,34 @@ fn current_deps(
         .of
         .iter()
         .map(|(column, parent)| {
+            let column = column.clone();
             if plan.allows_any(parent) {
-                return (column.clone(), Allowed::AnyValue);
+                return Dep {
+                    column,
+                    allowed: Allowed::AnyValue,
+                };
             }
             let state = match context.named.get(&parent.table) {
-                Some(named) => named.lock().unwrap(),
-                None => context.tables[&parent.table].lock().unwrap(),
+                Some(named) => lock(named),
+                None => lock(&context.tables[&parent.table]),
             };
             let values = &state.keys[&parent.column].order;
             let from = match cursors.as_deref_mut() {
                 Some(cursors) if cycle_deps == [column.as_str()] => {
                     let cursor = cursors.entry(index).or_insert(0);
-                    std::mem::replace(cursor, values.len())
+                    mem::replace(cursor, values.len())
                 }
                 _ => 0,
             };
-            (column.clone(), Allowed::Values(values[from..].to_vec()))
+            Dep {
+                column,
+                allowed: Allowed::Values(values[from..].to_vec()),
+            }
         })
         .collect()
 }
 
-async fn run_sampler(
-    context: &Arc<Shared>,
-    index: usize,
-    deps: Vec<(String, Allowed)>,
-) -> Result<()> {
+async fn run_sampler(context: &Arc<Shared>, index: usize, deps: Vec<Dep>) -> Result<()> {
     let sampler = &context.plan.samplers[index];
     let queries = sql::sampler_queries(sampler, &deps, context.options.chunk_size);
     if queries.is_empty() {
@@ -370,6 +395,9 @@ async fn run_sampler(
 
 /// Runs one SELECT, streaming its rows out as INSERTs. Returns the number of rows it returned.
 async fn run_query(context: &Shared, index: usize, query: Vec<u8>) -> Result<u64> {
+    use futures_util::StreamExt;
+    use mysql_async::prelude::Queryable;
+
     let sampler = &context.plan.samplers[index];
     let table = sampler.table.as_str();
     let mut connection = context.pool.get_conn().await?;
@@ -388,33 +416,20 @@ async fn run_query(context: &Shared, index: usize, query: Vec<u8>) -> Result<u64
         .collect();
     let kinds: Vec<Kind> = columns
         .iter()
-        .map(|column| Kind::of(column.column_type(), column.character_set()))
+        .map(|column| Kind::new(column.column_type(), column.character_set()))
         .collect();
-    let position = |column: &String| -> Result<(String, usize)> {
-        let index = names
-            .iter()
-            .position(|name| name == column)
-            .ok_or_else(|| {
-                anyhow!("{table} has no column {column}, which another sampler depends on")
-            })?;
-        Ok((column.clone(), index))
-    };
+    let mut named = None;
+    if let Some(name) = &sampler.name
+        && let Some(columns) = context.plan.named_keep.get(name)
+    {
+        named = Some(NamedKeep {
+            name,
+            columns: kept_columns(columns, &names, table)?,
+        });
+    }
     let keep = Keep {
-        table: context.plan.tables[table]
-            .keep
-            .iter()
-            .map(position)
-            .collect::<Result<_>>()?,
-        named: match &sampler.name {
-            Some(name) => context
-                .plan
-                .named_keep
-                .get(name)
-                .map(|columns| columns.iter().map(position).collect::<Result<Vec<_>>>())
-                .transpose()?
-                .map(|columns| (name.clone(), columns)),
-            None => None,
-        },
+        table: kept_columns(&context.plan.tables[table].keep, &names, table)?,
+        named,
     };
 
     let mut returned = 0;
@@ -426,7 +441,14 @@ async fn run_query(context: &Shared, index: usize, query: Vec<u8>) -> Result<u64
             let value = match row.as_ref(index) {
                 Some(Value::NULL) | None => None,
                 Some(Value::Bytes(bytes)) => Some(bytes.as_slice()),
-                Some(other) => bail!("unexpected value {other:?} in {table}.{}", names[index]),
+                Some(
+                    other @ (Value::Int(_)
+                    | Value::UInt(_)
+                    | Value::Float(_)
+                    | Value::Double(_)
+                    | Value::Date(..)
+                    | Value::Time(..)),
+                ) => bail!("unexpected value {other:?} in {table}.{}", names[index]),
             };
             literals.push(sql::literal(*kind, value));
         }
@@ -434,34 +456,73 @@ async fn run_query(context: &Shared, index: usize, query: Vec<u8>) -> Result<u64
         returned += 1;
 
         if batch.len() >= context.options.batch_rows {
-            write_batch(context, table, &names, &keep, std::mem::take(&mut batch)).await?;
+            write_batch(context, table, &names, &keep, mem::take(&mut batch)).await?;
         }
     }
     write_batch(context, table, &names, &keep, batch).await?;
     Ok(returned)
 }
 
+/// A column of a query's rows whose values are remembered.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct KeptColumn<'plan> {
+    name: &'plan str,
+    /// Where the column sits in the query's rows.
+    position: usize,
+}
+
+/// The columns of a query's rows to remember for the sampler's own name.
+#[derive(Debug, Clone, PartialEq)]
+struct NamedKeep<'plan> {
+    name: &'plan str,
+    columns: Vec<KeptColumn<'plan>>,
+}
+
 /// Which columns of a query's rows to remember: for the table, and for the sampler's own name.
-struct Keep {
-    table: Vec<(String, usize)>,
-    named: Option<(String, Vec<(String, usize)>)>,
+#[derive(Debug, Clone, PartialEq)]
+struct Keep<'plan> {
+    table: Vec<KeptColumn<'plan>>,
+    named: Option<NamedKeep<'plan>>,
+}
+
+/// Finds where each of `columns` sits among a query's column `names`. Fails if `table` lacks one.
+fn kept_columns<'plan>(
+    columns: &'plan BTreeSet<String>,
+    names: &[String],
+    table: &str,
+) -> Result<Vec<KeptColumn<'plan>>> {
+    let mut kept = Vec::with_capacity(columns.len());
+    for name in columns {
+        let position = names
+            .iter()
+            .position(|found| found == name)
+            .ok_or_else(|| {
+                anyhow!("{table} has no column {name}, which another sampler depends on")
+            })?;
+        kept.push(KeptColumn { name, position });
+    }
+    Ok(kept)
 }
 
 async fn write_batch(
     context: &Shared,
     table: &str,
     names: &[String],
-    keep: &Keep,
+    keep: &Keep<'_>,
     batch: Vec<Vec<Vec<u8>>>,
 ) -> Result<()> {
     // A named sampler's keys come from every row it returned, even rows another sampler of the
     // table already wrote.
-    if let Some((name, columns)) = &keep.named {
-        let mut state = context.named[name].lock().unwrap();
+    if let Some(named) = &keep.named {
+        let mut state = lock(&context.named[named.name]);
         for row in &batch {
-            for (column, index) in columns {
-                if row[*index] != sql::NULL {
-                    state.keys.get_mut(column).unwrap().insert(&row[*index]);
+            for column in &named.columns {
+                if row[column.position] != sql::NULL {
+                    state
+                        .keys
+                        .get_mut(column.name)
+                        .expect("a named sampler's state has a key set per kept column")
+                        .insert(&row[column.position]);
                 }
             }
         }
@@ -469,15 +530,19 @@ async fn write_batch(
 
     let rows = {
         let dedupe = context.plan.tables[table].dedupe;
-        let mut state = context.tables[table].lock().unwrap();
+        let mut state = lock(&context.tables[table]);
         let mut rows = Vec::with_capacity(batch.len());
         for row in batch {
             if dedupe && !state.seen.insert(row_hash(&row)) {
                 continue;
             }
-            for (column, index) in &keep.table {
-                if row[*index] != sql::NULL {
-                    state.keys.get_mut(column).unwrap().insert(&row[*index]);
+            for column in &keep.table {
+                if row[column.position] != sql::NULL {
+                    state
+                        .keys
+                        .get_mut(column.name)
+                        .expect("a table's state has a key set per kept column")
+                        .insert(&row[column.position]);
                 }
             }
             rows.push(row);
@@ -496,13 +561,14 @@ async fn write_batch(
     Ok(())
 }
 
+#[must_use]
 fn row_hash(row: &[Vec<u8>]) -> u128 {
     let mut buffer = Vec::new();
     for literal in row {
         buffer.extend_from_slice(&(literal.len() as u64).to_le_bytes());
         buffer.extend_from_slice(literal);
     }
-    xxh3_128(&buffer)
+    xxh3::xxh3_128(&buffer)
 }
 
 fn log(context: &Shared, message: &str) {
