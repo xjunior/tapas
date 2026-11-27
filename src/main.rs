@@ -1,5 +1,6 @@
-use std::path::PathBuf;
+//! The `tapas` command line.
 
+use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::Result;
@@ -7,7 +8,7 @@ use clap::Parser;
 use tapas::{Config, Options, Output, Plan, Since};
 
 /// Extracts a sample of a MySQL database that keeps its references intact.
-#[derive(Parser)]
+#[derive(Debug, Parser)]
 #[command(version)]
 struct Args {
     /// YAML files listing the samplers. Glob patterns work too: quote them, as in
@@ -61,7 +62,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let started = Instant::now();
 
-    let plan = Plan::build(Config::load(&args.configs)?, args.since)?;
+    let plan = Plan::try_new(Config::load(&args.configs)?, args.since)?;
     if args.plan {
         print!("{}", plan.describe());
         return Ok(());
@@ -87,9 +88,8 @@ async fn main() -> Result<()> {
         eprintln!("{count:>12}  {table}");
     }
     eprintln!(
-        "{total:>12}  rows in {:.2}s -> {}",
-        started.elapsed().as_secs_f64(),
-        output
+        "{total:>12}  rows in {:.2}s -> {output}",
+        started.elapsed().as_secs_f64()
     );
     Ok(())
 }

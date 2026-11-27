@@ -1,8 +1,12 @@
 //! The example from the design discussion: deps pull in the rows they point at. Needs
 //! TAPAS_TEST_DATABASE_URL, like end_to_end.rs.
 
+use std::{env, fs, process};
+
+use anyhow::Result;
 use mysql_async::prelude::Queryable;
 use mysql_async::{Conn, Opts};
+use tapas::{Config, Options, Output, Plan, Since};
 
 const SCHEMA: &str = r#"
 CREATE TABLE territories (id BIGINT PRIMARY KEY);
@@ -37,67 +41,66 @@ samplers:
   - table: territories
 "#;
 
-async fn ids(conn: &mut Conn, table: &str) -> Vec<u64> {
-    conn.query(format!("SELECT id FROM {table} ORDER BY id"))
-        .await
-        .unwrap()
+async fn ids(connection: &mut Conn, table: &str) -> Result<Vec<u64>> {
+    let ids: Vec<u64> = connection
+        .query(format!("SELECT id FROM {table} ORDER BY id"))
+        .await?;
+    Ok(ids)
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn deps_pull_in_what_the_rows_point_at() {
-    let Ok(base) = std::env::var("TAPAS_TEST_DATABASE_URL") else {
+async fn deps_pull_in_what_the_rows_point_at() -> Result<()> {
+    let Ok(base) = env::var("TAPAS_TEST_DATABASE_URL") else {
         eprintln!("TAPAS_TEST_DATABASE_URL not set, skipping");
-        return;
+        return Ok(());
     };
 
-    let mut conn = Conn::new(Opts::from_url(&base).unwrap()).await.unwrap();
+    let mut connection = Conn::new(Opts::from_url(&base)?).await?;
     for database in ["tapas_refs_source", "tapas_refs_target"] {
-        conn.query_drop(format!(
-            "DROP DATABASE IF EXISTS {database}; CREATE DATABASE {database}"
-        ))
-        .await
-        .unwrap();
+        connection
+            .query_drop(format!(
+                "DROP DATABASE IF EXISTS {database}; CREATE DATABASE {database}"
+            ))
+            .await?;
     }
-    conn.query_drop(format!("USE tapas_refs_source; {SCHEMA} {SEED}"))
-        .await
-        .unwrap();
-    conn.query_drop(format!("USE tapas_refs_target; {SCHEMA}"))
-        .await
-        .unwrap();
+    connection
+        .query_drop(format!("USE tapas_refs_source; {SCHEMA} {SEED}"))
+        .await?;
+    connection
+        .query_drop(format!("USE tapas_refs_target; {SCHEMA}"))
+        .await?;
 
-    let plan = tapas::Plan::build(
-        tapas::Config::parse(SAMPLERS).unwrap(),
-        Some("2 weeks".parse().unwrap()),
-    )
-    .unwrap();
-    let output = std::env::temp_dir().join(format!("tapas-refs-{}.sql", std::process::id()));
+    let config: Config = SAMPLERS.parse()?;
+    let since: Since = "2 weeks".parse().map_err(anyhow::Error::msg)?;
+    let plan = Plan::try_new(config, Some(since))?;
+    let output = env::temp_dir().join(format!("tapas-refs-{}.sql", process::id()));
     tapas::run(
         plan,
         &format!("{base}/tapas_refs_source"),
         4,
-        &tapas::Output::File(output.clone()),
-        tapas::Options::default(),
+        &Output::File(output.clone()),
+        Options::default(),
     )
-    .await
-    .unwrap();
+    .await?;
 
-    let sql = std::fs::read_to_string(&output).unwrap();
-    std::fs::remove_file(&output).unwrap();
-    conn.query_drop(format!("USE tapas_refs_target; {sql}"))
-        .await
-        .unwrap();
+    let sql = fs::read_to_string(&output)?;
+    fs::remove_file(&output)?;
+    connection
+        .query_drop(format!("USE tapas_refs_target; {sql}"))
+        .await?;
 
     // Orders from the last two weeks, whoever placed them.
-    assert_eq!(ids(&mut conn, "orders").await, [1, 2]);
+    assert_eq!(ids(&mut connection, "orders").await?, [1, 2]);
     // Users over 25, plus user 2, who is 20 but placed a recent order.
     let mut expected: Vec<u64> = (11..=20).collect();
     expected.insert(0, 2);
-    assert_eq!(ids(&mut conn, "users").await, expected);
+    assert_eq!(ids(&mut connection, "users").await?, expected);
     // Every territory.
-    assert_eq!(ids(&mut conn, "territories").await, [1, 2, 3]);
+    assert_eq!(ids(&mut connection, "territories").await?, [1, 2, 3]);
 
-    conn.query_drop("DROP DATABASE tapas_refs_source; DROP DATABASE tapas_refs_target")
-        .await
-        .unwrap();
-    conn.disconnect().await.unwrap();
+    connection
+        .query_drop("DROP DATABASE tapas_refs_source; DROP DATABASE tapas_refs_target")
+        .await?;
+    connection.disconnect().await?;
+    Ok(())
 }

@@ -2,8 +2,12 @@
 //! create databases (no database in the path), e.g. mysql://root:tapas@127.0.0.1:3399
 //! Without it, the test is skipped.
 
+use std::{env, fs, process};
+
+use anyhow::{Context, Result};
 use mysql_async::prelude::Queryable;
 use mysql_async::{Conn, Opts};
+use tapas::{Config, Options, Output, Plan, Since};
 
 const SCHEMA: &str = r#"
 CREATE TABLE countries (id INT PRIMARY KEY, code CHAR(2) NOT NULL);
@@ -82,60 +86,61 @@ samplers:
     time_column: [created_at, updated_at]
 "#;
 
-async fn scalar(conn: &mut Conn, query: &str) -> u64 {
-    conn.query_first::<u64, _>(query).await.unwrap().unwrap()
+async fn scalar(connection: &mut Conn, query: &str) -> Result<u64> {
+    let value: Option<u64> = connection.query_first(query).await?;
+    value.with_context(|| format!("`{query}` returned no rows"))
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn extracts_a_sample_that_keeps_references() {
-    let Ok(base) = std::env::var("TAPAS_TEST_DATABASE_URL") else {
+async fn extracts_a_sample_that_keeps_references() -> Result<()> {
+    let Ok(base) = env::var("TAPAS_TEST_DATABASE_URL") else {
         eprintln!("TAPAS_TEST_DATABASE_URL not set, skipping");
-        return;
+        return Ok(());
     };
 
-    let mut conn = Conn::new(Opts::from_url(&base).unwrap()).await.unwrap();
+    let mut connection = Conn::new(Opts::from_url(&base)?).await?;
     for database in ["tapas_source", "tapas_target"] {
-        conn.query_drop(format!(
-            "DROP DATABASE IF EXISTS {database}; CREATE DATABASE {database}"
-        ))
-        .await
-        .unwrap();
+        connection
+            .query_drop(format!(
+                "DROP DATABASE IF EXISTS {database}; CREATE DATABASE {database}"
+            ))
+            .await?;
     }
-    conn.query_drop(format!("USE tapas_source; {SCHEMA} {SEED}"))
-        .await
-        .unwrap();
-    conn.query_drop(format!("USE tapas_target; {SCHEMA}"))
-        .await
-        .unwrap();
+    connection
+        .query_drop(format!("USE tapas_source; {SCHEMA} {SEED}"))
+        .await?;
+    connection
+        .query_drop(format!("USE tapas_target; {SCHEMA}"))
+        .await?;
 
-    let output = std::env::temp_dir().join(format!("tapas-test-{}.sql", std::process::id()));
-    let plan = tapas::Plan::build(
-        tapas::Config::parse(SAMPLERS).unwrap(),
-        Some("2 weeks".parse().unwrap()),
-    )
-    .unwrap();
+    let output = env::temp_dir().join(format!("tapas-test-{}.sql", process::id()));
+    let config: Config = SAMPLERS.parse()?;
+    let since: Since = "2 weeks".parse().map_err(anyhow::Error::msg)?;
+    let plan = Plan::try_new(config, Some(since))?;
     let rows = tapas::run(
         plan,
         &format!("{base}/tapas_source"),
         4,
-        &tapas::Output::File(output.clone()),
+        &Output::File(output.clone()),
         // Small chunks and batches so chunking and batching are exercised.
-        tapas::Options {
+        Options {
             chunk_size: 7,
             batch_rows: 13,
         },
     )
-    .await
-    .unwrap();
+    .await?;
 
-    let sql = std::fs::read_to_string(&output).unwrap();
-    std::fs::remove_file(&output).unwrap();
-    conn.query_drop(format!("USE tapas_target; {sql}"))
-        .await
-        .unwrap();
+    let sql = fs::read_to_string(&output)?;
+    fs::remove_file(&output)?;
+    connection
+        .query_drop(format!("USE tapas_target; {sql}"))
+        .await?;
 
     // All countries.
-    assert_eq!(scalar(&mut conn, "SELECT COUNT(*) FROM countries").await, 5);
+    assert_eq!(
+        scalar(&mut connection, "SELECT COUNT(*) FROM countries").await?,
+        5
+    );
 
     // The 100 newest users with a country (multiples of 7 have none), plus every admin
     // (multiples of 50), with users in both samples counted once.
@@ -149,34 +154,44 @@ async fn extracts_a_sample_that_keeps_references() {
         "the two samples should overlap"
     );
     assert_eq!(
-        scalar(&mut conn, "SELECT COUNT(*) FROM users").await,
+        scalar(&mut connection, "SELECT COUNT(*) FROM users").await?,
         expected_users
     );
     assert_eq!(rows["users"], expected_users);
     assert_eq!(
-        scalar(&mut conn, "SELECT COUNT(*) FROM users WHERE admin = 1").await,
+        scalar(
+            &mut connection,
+            "SELECT COUNT(*) FROM users WHERE admin = 1"
+        )
+        .await?,
         6
     );
 
     // Every child row of an extracted parent came along, and nothing else.
     assert_eq!(
-        scalar(&mut conn, "SELECT COUNT(*) FROM phones").await,
+        scalar(&mut connection, "SELECT COUNT(*) FROM phones").await?,
         expected_users * 2
     );
     assert_eq!(
-        scalar(&mut conn, "SELECT COUNT(*) FROM orders").await,
+        scalar(&mut connection, "SELECT COUNT(*) FROM orders").await?,
         expected_users * 3
     );
     assert_eq!(
-        scalar(&mut conn, "SELECT COUNT(*) FROM line_items").await,
+        scalar(&mut connection, "SELECT COUNT(*) FROM line_items").await?,
         expected_users * 6
     );
 
     // The limit holds across chunks.
-    assert_eq!(scalar(&mut conn, "SELECT COUNT(*) FROM notes").await, 15);
+    assert_eq!(
+        scalar(&mut connection, "SELECT COUNT(*) FROM notes").await?,
+        15
+    );
 
     // --since 2 weeks: the 14 events created in that window, plus the 5 older ones updated today.
-    assert_eq!(scalar(&mut conn, "SELECT COUNT(*) FROM events").await, 19);
+    assert_eq!(
+        scalar(&mut connection, "SELECT COUNT(*) FROM events").await?,
+        19
+    );
     assert_eq!(rows["events"], 19);
 
     // No dangling references.
@@ -188,29 +203,30 @@ async fn extracts_a_sample_that_keeps_references() {
         ("line_items", "order_id", "orders"),
     ] {
         let dangling = scalar(
-            &mut conn,
+            &mut connection,
             &format!(
                 "SELECT COUNT(*) FROM {child} c LEFT JOIN {parent} p ON p.id = c.{column} \
                  WHERE c.{column} IS NOT NULL AND p.id IS NULL"
             ),
         )
-        .await;
+        .await?;
         assert_eq!(dangling, 0, "{child}.{column} has rows without a {parent}");
     }
 
     // Every value made it across unchanged.
     let changed = scalar(
-        &mut conn,
+        &mut connection,
         "SELECT COUNT(*) FROM tapas_target.users t JOIN tapas_source.users s ON s.id = t.id \
          WHERE NOT (t.country_id <=> s.country_id AND t.admin <=> s.admin AND t.name <=> s.name \
            AND t.bio <=> s.bio AND t.token <=> s.token AND t.settings <=> s.settings \
            AND t.balance <=> s.balance AND t.created_at <=> s.created_at)",
     )
-    .await;
-    assert_eq!(changed, 0);
+    .await?;
+    assert_eq!(changed, 0, "values changed on the way across");
 
-    conn.query_drop("DROP DATABASE tapas_source; DROP DATABASE tapas_target")
-        .await
-        .unwrap();
-    conn.disconnect().await.unwrap();
+    connection
+        .query_drop("DROP DATABASE tapas_source; DROP DATABASE tapas_target")
+        .await?;
+    connection.disconnect().await?;
+    Ok(())
 }

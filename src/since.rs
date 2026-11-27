@@ -1,22 +1,40 @@
-use std::fmt;
+//! The `--since` span: how far back samplers with a `time_column` reach.
+
+use std::fmt::{self, Display, Formatter};
 use std::str::FromStr;
 
+use crate::sql;
+
 /// How far back samplers with a `time_column` reach: `--since '3 months'`, or `--since ever`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Since {
+    /// Every row is kept, however old.
     Ever,
-    Back { amount: u32, unit: Unit },
+    /// Rows from the last `amount` `unit`s are kept.
+    Back {
+        /// How many units back the span reaches. It's never 0.
+        amount: u32,
+        /// What the span counts in.
+        unit: Unit,
+    },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The unit of a `Since::Back` span.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Unit {
+    /// A calendar day.
     Day,
+    /// Seven days.
     Week,
+    /// A calendar month.
     Month,
+    /// A calendar year.
     Year,
 }
 
 impl Unit {
+    /// Returns the MySQL interval unit keyword.
+    #[must_use]
     fn sql(self) -> &'static str {
         match self {
             Unit::Day => "DAY",
@@ -27,9 +45,22 @@ impl Unit {
     }
 }
 
+impl Display for Unit {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Unit::Day => "day",
+            Unit::Week => "week",
+            Unit::Month => "month",
+            Unit::Year => "year",
+        };
+        f.write_str(name)
+    }
+}
+
 impl Since {
-    /// The SQL condition for `columns`, or nothing for `Since::Ever`. Rows match when any of the
-    /// columns falls on or after midnight of the cutoff day.
+    /// Returns the SQL condition for `columns`, or nothing for `Since::Ever`. Rows match when any
+    /// of the columns falls on or after midnight of the cutoff day.
+    #[must_use]
     pub fn condition(&self, columns: &[String]) -> Option<String> {
         let Since::Back { amount, unit } = self else {
             return None;
@@ -38,15 +69,14 @@ impl Since {
             return None;
         }
         let cutoff = format!("CURDATE() - INTERVAL {amount} {}", unit.sql());
-        let checks: Vec<String> = columns
+        let mut checks: Vec<String> = columns
             .iter()
-            .map(|column| format!("{} >= {cutoff}", crate::sql::ident(column)))
+            .map(|column| format!("{} >= {cutoff}", sql::identifier(column)))
             .collect();
-        Some(if checks.len() == 1 {
-            checks.into_iter().next().unwrap()
-        } else {
-            format!("({})", checks.join(" OR "))
-        })
+        if checks.len() == 1 {
+            return checks.pop();
+        }
+        Some(format!("({})", checks.join(" OR ")))
     }
 }
 
@@ -61,7 +91,7 @@ impl FromStr for Since {
 
         let invalid = || format!("`{text}` isn't a span like `2 weeks` or `3 months`, or `ever`");
         let digits = text
-            .find(|c: char| !c.is_ascii_digit())
+            .find(|character: char| !character.is_ascii_digit())
             .ok_or_else(invalid)?;
         let amount: u32 = text[..digits].parse().map_err(|_| invalid())?;
         if amount == 0 {
@@ -78,14 +108,13 @@ impl FromStr for Since {
     }
 }
 
-impl fmt::Display for Since {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Display for Since {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Since::Ever => write!(f, "ever"),
             Since::Back { amount, unit } => {
-                let name = format!("{unit:?}").to_ascii_lowercase();
                 let plural = if *amount == 1 { "" } else { "s" };
-                write!(f, "{amount} {name}{plural}")
+                write!(f, "{amount} {unit}{plural}")
             }
         }
     }
@@ -98,11 +127,11 @@ mod tests {
     #[test]
     fn parses_spans() {
         let back = |amount, unit| Since::Back { amount, unit };
-        assert_eq!("2 weeks".parse(), Ok(back(2, Unit::Week)));
-        assert_eq!("3months".parse(), Ok(back(3, Unit::Month)));
-        assert_eq!(" 1 Day ".parse(), Ok(back(1, Unit::Day)));
-        assert_eq!("10 years".parse(), Ok(back(10, Unit::Year)));
-        assert_eq!("EVER".parse(), Ok(Since::Ever));
+        assert_eq!("2 weeks".parse::<Since>(), Ok(back(2, Unit::Week)));
+        assert_eq!("3months".parse::<Since>(), Ok(back(3, Unit::Month)));
+        assert_eq!(" 1 Day ".parse::<Since>(), Ok(back(1, Unit::Day)));
+        assert_eq!("10 years".parse::<Since>(), Ok(back(10, Unit::Year)));
+        assert_eq!("EVER".parse::<Since>(), Ok(Since::Ever));
     }
 
     #[test]
@@ -117,31 +146,38 @@ mod tests {
             "-1 day",
             "1.5 months",
         ] {
-            assert!(bad.parse::<Since>().is_err(), "{bad:?} should fail");
+            let parsed: Result<Since, String> = bad.parse();
+            assert!(parsed.is_err(), "{bad:?} parsed as {parsed:?}");
         }
     }
 
     #[test]
-    fn displays_spans() {
-        assert_eq!("1 week".parse::<Since>().unwrap().to_string(), "1 week");
-        assert_eq!("3 months".parse::<Since>().unwrap().to_string(), "3 months");
+    fn displays_spans() -> Result<(), String> {
+        let week: Since = "1 week".parse()?;
+        assert_eq!(week.to_string(), "1 week");
+        let months: Since = "3 months".parse()?;
+        assert_eq!(months.to_string(), "3 months");
         assert_eq!(Since::Ever.to_string(), "ever");
+        Ok(())
     }
 
     #[test]
-    fn builds_conditions() {
-        let since: Since = "2 weeks".parse().unwrap();
+    fn builds_conditions() -> Result<(), String> {
+        let since: Since = "2 weeks".parse()?;
         assert_eq!(
-            since.condition(&["created_at".into()]).unwrap(),
-            "`created_at` >= CURDATE() - INTERVAL 2 WEEK"
+            since.condition(&["created_at".to_string()]).as_deref(),
+            Some("`created_at` >= CURDATE() - INTERVAL 2 WEEK")
         );
         assert_eq!(
             since
-                .condition(&["created_at".into(), "updated_at".into()])
-                .unwrap(),
-            "(`created_at` >= CURDATE() - INTERVAL 2 WEEK OR `updated_at` >= CURDATE() - INTERVAL 2 WEEK)"
+                .condition(&["created_at".to_string(), "updated_at".to_string()])
+                .as_deref(),
+            Some(
+                "(`created_at` >= CURDATE() - INTERVAL 2 WEEK OR `updated_at` >= CURDATE() - INTERVAL 2 WEEK)"
+            )
         );
-        assert_eq!(Since::Ever.condition(&["created_at".into()]), None);
+        assert_eq!(Since::Ever.condition(&["created_at".to_string()]), None);
         assert_eq!(since.condition(&[]), None);
+        Ok(())
     }
 }
