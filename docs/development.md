@@ -40,8 +40,36 @@ cargo clippy --all-targets
 
 Both should be clean.
 
-## Before a release
+## Commits
 
-1. Move the entries under `Unreleased` in [CHANGELOG.md](../CHANGELOG.md) to a new version, dated.
-2. Bump `version` in `Cargo.toml`.
-3. Run the full test suite against MySQL.
+Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/). They decide the next version
+and what goes in the changelog:
+
+| Prefix | Means | Version |
+| --- | --- | --- |
+| `feat:` | Something new for people using tapas | Minor |
+| `fix:` | A bug fixed | Patch |
+| `feat!:`, or a `BREAKING CHANGE:` footer | Configs or flags that worked before no longer do | Major |
+| `docs:`, `ci:`, `test:`, `refactor:`, `chore:` | Nothing users notice | None |
+
+While tapas is below 1.0, breaking changes bump the minor version instead.
+
+## Releasing
+
+Releases are cut by [release-please](https://github.com/googleapis/release-please):
+
+1. Every push to `main` updates an open release PR with the next version and the changelog entries since the last
+   release.
+2. Merging that PR bumps `Cargo.toml`, tags `vX.Y.Z`, and publishes a GitHub release.
+3. The same workflow builds tapas for Linux (x86_64 and arm64, static musl) and macOS (Apple silicon and Intel), and
+   attaches each build to the release with a SHA-256 checksum.
+4. It then points the formula in [xjunior/homebrew-tap](https://github.com/xjunior/homebrew-tap) at the new builds.
+
+To build and publish an existing tag again, run the **Release** workflow by hand with that tag.
+
+### Setup
+
+- **Release PRs:** in the repository's Actions settings, allow GitHub Actions to create pull requests.
+- **Homebrew:** add a `HOMEBREW_TAP_TOKEN` secret holding a fine-grained token with read and write access to the
+  contents of `xjunior/homebrew-tap`. Without it, releases still build, and the workflow warns that the formula wasn't
+  updated.

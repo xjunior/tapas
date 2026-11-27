@@ -15,11 +15,20 @@ one that was left behind.
 
 ## Install
 
+With Homebrew, on macOS or Linux:
+
 ```sh
-cargo install --path .
+brew install xjunior/tap/tapas
 ```
 
-That puts `tapas` in `~/.cargo/bin`. It needs Rust 1.89 or newer.
+Or download the build for your platform from the [releases](https://github.com/xjunior/tapas/releases): Linux
+(x86_64 and arm64, static) or macOS (Apple silicon and Intel). Each comes with a SHA-256 checksum.
+
+Or build it yourself with Rust 1.89 or newer:
+
+```sh
+cargo install --git https://github.com/xjunior/tapas
+```
 
 ## Quick start
 
