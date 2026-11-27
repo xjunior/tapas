@@ -1,14 +1,26 @@
 # Changelog
 
-Every notable change to tapas lands here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Every notable change to tapas lands here. Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0](https://github.com/xjunior/tapas/compare/v0.1.0...v0.2.0) (2026-11-27)
 
-### Added
 
-- **`--target`**, to write the sample straight into another database instead of a file, in one transaction that's
-  only committed once the whole sample worked. `TAPAS_TARGET_URL` works too.
+### Features
+
+* gzip the output when its path ends in .gz ([6c198d6](https://github.com/xjunior/tapas/commit/6c198d6d95a3b1ab538eeac0d81df9de1f53f8fd))
+* read sanitize rules from the config ([ed3a086](https://github.com/xjunior/tapas/commit/ed3a086223b345f56400807d3e73385938f1cc6b))
+* sanitize values on their way into the sample ([f2b7710](https://github.com/xjunior/tapas/commit/f2b7710e735424c071a48023aa27b4f656e31e73))
+* write the sample straight into a target database ([8fab89d](https://github.com/xjunior/tapas/commit/8fab89da73e858286f5f2da589cd088e3a6c2a6b))
+
+
+### Bug Fixes
+
+* require Rust 1.89, the oldest that builds the dependencies ([c3c2260](https://github.com/xjunior/tapas/commit/c3c226030371c1cd05b5abbdec33ba72f3293bdf))
+
+
+### Performance Improvements
+
+* cut allocations on the per-row paths ([35e25f0](https://github.com/xjunior/tapas/commit/35e25f092dae7d3715c156f7d5b672384c6d27c0))
 
 ## [0.1.0] - 2026-11-27
 
@@ -33,5 +45,4 @@ The first version: a sample of a MySQL database, written to a SQL file, with eve
 - **Clear errors.** Unknown keys, missing parents, name clashes and conflicting `deps` are caught before anything runs,
   and every error names the file and sampler it came from.
 
-[Unreleased]: https://github.com/xjunior/tapas/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/xjunior/tapas/releases/tag/v0.1.0
