@@ -19,7 +19,7 @@ one that was left behind.
 cargo install --path .
 ```
 
-That puts `tapas` in `~/.cargo/bin`. It needs Rust 1.88 or newer.
+That puts `tapas` in `~/.cargo/bin`. It needs Rust 1.89 or newer.
 
 ## Quick start
 

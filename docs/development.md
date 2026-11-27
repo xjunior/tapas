@@ -6,7 +6,7 @@
 cargo build --release
 ```
 
-The binary lands in `target/release/tapas`. tapas needs Rust 1.88 or newer.
+The binary lands in `target/release/tapas`. tapas needs Rust 1.89 or newer.
 
 ## Test
 
