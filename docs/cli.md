@@ -20,17 +20,22 @@ tapas [OPTIONS] <CONFIGS>...
 
 ## `--source`
 
-The database to read, as a MySQL URL:
+The database to read, as a MySQL or Postgres URL:
 
 ```sh
 tapas tapas.yml --source mysql://user:password@host:3306/shop -o sample.sql
+tapas tapas.yml --source postgres://user:password@host:5432/shop -o sample.sql
 ```
 
-Every connection is set to `READ ONLY`, so tapas can't change the source.
+Every connection is read-only, so tapas can't change the source. The sample is written for the same kind of database:
+MySQL SQL from MySQL, Postgres SQL from Postgres.
+
+In Postgres, tapas reads the tables of the connection's current schema, the first one in its `search_path`. To pick
+another, set it in the URL: `postgres://user:password@host:5432/shop?options=-c%20search_path%3Dsales`.
 
 ## `--target`
 
-The database to write into, instead of a file:
+The database to write into, instead of a file. It must be the same kind as the source:
 
 ```sh
 tapas tapas.yml --source mysql://user:password@host:3306/shop --target mysql://root@localhost:3306/shop_dev
@@ -40,14 +45,27 @@ tapas tapas.yml --source mysql://user:password@host:3306/shop --target mysql://r
 - Everything goes in one transaction, committed only once the whole sample worked. A failed run leaves the target as
   it was.
 - Foreign-key checks are off for tapas's connection, so rows land in any order.
-- tapas refuses a target that is the source.
+- tapas refuses a target that is the source, or a target of another kind.
+
+Postgres has no switch for foreign-key checks alone, so tapas sets `session_replication_role = replica`, which also
+skips the target's ordinary triggers while it loads. That takes a superuser, or on Postgres 15 and later:
+
+```sql
+GRANT SET ON PARAMETER session_replication_role TO tapas_writer;
+```
+
+Before committing, tapas moves the sequence of each `serial` and identity column to the column's highest value, so
+rows the application inserts next don't clash with copied ones. MySQL's `AUTO_INCREMENT` does this by itself.
 
 ## Connection URLs
 
 `--source` and `--target` take the same kind of URL:
 
 - Percent-encode special characters in the user or password, such as `@` as `%40`.
-- Turn on TLS with query parameters, such as `?require_ssl=true&verify_ca=true&verify_identity=true`.
+- MySQL: turn on TLS with query parameters, such as `?require_ssl=true&verify_ca=true&verify_identity=true`.
+- Postgres: tapas uses TLS whenever the server offers it, and checks the server's certificate against the public
+  certificate authorities. `?sslmode=require` refuses a server without TLS; `?sslmode=disable` turns TLS off. See
+  [Limitations](limitations.md#connections).
 
 A password on the command line is visible to anyone running `ps`, and ends up in shell history and CI logs. To keep it
 off, set the URL in an environment variable and leave the flag out:
@@ -97,7 +115,8 @@ Treat the seed like a password, and keep it off the command line the same way: s
 
 ## `--plan`
 
-Prints every table in the order tapas would run it, with the queries its samplers send:
+Prints every table in the order tapas would run it, with the queries its samplers send. It doesn't connect, but it
+writes the queries for the kind of database `--source` names, or for MySQL without `--source`:
 
 ```
 $ tapas tapas.example.yml --since '2 weeks' --plan
@@ -134,17 +153,20 @@ phones  (after users; sanitizes number: fake phone)
 With `--target`, rows go straight into the database, as above. With `--output`, tapas writes to `<FILE>.partial` and renames it to `<FILE>` only once the whole sample worked, so a failed run never
 leaves something that looks complete. The file:
 
-- starts with `SET NAMES utf8mb4` and `SET FOREIGN_KEY_CHECKS=0`, so tables load in any order;
-- holds one multi-row `INSERT` per batch, with table names that carry no database;
-- ends with `SET FOREIGN_KEY_CHECKS=1`;
+- starts with `SET NAMES utf8mb4` and `SET FOREIGN_KEY_CHECKS=0`, so tables load in any order. For Postgres, it sets
+  `session_replication_role = replica` instead, which needs the privilege [`--target`](#--target) describes;
+- holds one multi-row `INSERT` per batch, with table names that carry no database or schema;
+- ends with `SET FOREIGN_KEY_CHECKS=1`. For Postgres, it moves the tables' sequences past the copied rows, then resets
+  `session_replication_role`;
 - has no schema, `TRUNCATE` or `DROP`. Load it into a database with the schema and empty tables.
 
-When `<FILE>` ends in `.gz`, tapas gzips the SQL as it writes it, so the uncompressed SQL never touches the disk. MySQL
-can't read gzip itself; decompress on the way in:
+When `<FILE>` ends in `.gz`, tapas gzips the SQL as it writes it, so the uncompressed SQL never touches the disk.
+Neither `mysql` nor `psql` reads gzip itself; decompress on the way in:
 
 ```sh
 tapas tapas.yml -o sample.sql.gz
 gunzip -c sample.sql.gz | mysql -h host -u user -p shop
+gunzip -c sample.sql.gz | psql -h host -U user shop
 ```
 
 tapas uses gzip's fastest level, so compressing doesn't slow the run. The file is about a quarter of the plain SQL's size.

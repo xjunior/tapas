@@ -9,12 +9,14 @@ This page is for people changing tapas.
 | `config` | Loads the YAML files, expands globs, and labels each sampler with where it came from. |
 | `since` | Parses `--since` and turns a `time_column` into a SQL condition. |
 | `plan` | Validates the samplers, turns `deps` into samplers, finds cycles, and orders the tables. |
-| `sql` | Builds the queries and the `INSERT`s, and writes values as MySQL literals. |
+| `sql` | Builds the queries, the `INSERT`s and the file's first and last lines, and writes values as literals, in MySQL's or Postgres's SQL. |
 | `sanitize` | Works out what each table's sanitize rules do to its columns, and rewrites rows to match. |
 | `fake` | Makes fake values from a seed. |
 | `extract` | Runs the plan: schedules samplers, streams rows, and keeps the values children need. |
+| `source` | Opens the source's read-only connections and reads the columns the sanitize rules cover. |
+| `postgres` | Connects to Postgres, over TLS when the server offers it, and pools the source's connections. |
 | `output` | Writes the sample: a SQL file on its own thread, or a target database in one transaction. |
-| `run` | Connects to the source, reads the columns the sanitize rules cover, and wires the plan, the extraction and the output together. |
+| `run` | Picks MySQL or Postgres from the URLs, refuses a target of another kind, and wires the source, the plan, the extraction and the output together. |
 
 ## From config to plan
 
@@ -75,7 +77,9 @@ aren't part of it, which is what makes the same value's fake the same everywhere
 
 The writer receives finished `INSERT` statements over a bounded channel, so a slow disk or target slows the queries
 down rather than filling memory. It keeps the sample only if the whole run worked: see
-[The output](cli.md#the-output). Values are written from MySQL's text protocol:
+[The output](cli.md#the-output).
+
+From MySQL, values are written from its text protocol, by column type:
 
 | Column type | Written as |
 | --- | --- |
@@ -83,3 +87,8 @@ down rather than filling memory. It keeps the sample only if the whole run worke
 | Dates, times, `JSON` | Quoted strings |
 | `BIT`, geometry, binary strings and blobs | Hex, as `X'…'` |
 | Everything else | Quoted, with `\`, `'`, NUL, newlines and `\Z` escaped |
+
+From Postgres, every value is read as text with the simple query protocol and written as a quoted literal, with `'`
+doubled, such as `'42'`, `'t'` or `'\x00ff'`. Postgres turns each literal into its column's type as the row goes in, so
+tapas needs no list of types: arrays, enums and `jsonb` work too. Source connections set `DateStyle=ISO`,
+`extra_float_digits=1` and `standard_conforming_strings=on`, so the text reads back as exactly the same value.
