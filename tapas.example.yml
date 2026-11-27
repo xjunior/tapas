@@ -1,0 +1,33 @@
+# A small shop: countries, users, their phones, and orders with their line items.
+#
+#   tapas tapas.example.yml --since '2 weeks' --plan
+#   tapas tapas.example.yml --since '2 weeks' -o sample.sql
+
+samplers:
+  # Every country.
+  - table: countries
+
+  # The 100 newest users, and every admin. Each brings along the country it points at.
+  - table: users
+    order_by: id DESC
+    limit: 100
+    deps:
+      country_id: countries.id
+  - table: users
+    where: admin = 1
+
+  # Orders placed within --since, whoever placed them. Their users come along.
+  - table: orders
+    time_column: created_at
+    deps:
+      user_id: users.id
+
+  # The phones of every user in the sample.
+  - table: phones
+    of:
+      user_id: users.id
+
+  # The line items of every order in the sample.
+  - table: line_items
+    of:
+      order_id: orders.id
