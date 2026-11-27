@@ -89,3 +89,57 @@ async fn writes_straight_into_a_target_database() -> Result<()> {
     connection.disconnect().await?;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn says_why_the_target_refused_a_statement() -> Result<()> {
+    let Ok(base) = env::var("TAPAS_TEST_DATABASE_URL") else {
+        eprintln!("TAPAS_TEST_DATABASE_URL not set, skipping");
+        return Ok(());
+    };
+
+    // The target's users table lacks a column the source has, as after a migration the target
+    // hasn't run. More statements than the output's channel holds make extraction still be
+    // sending when the target refuses the first one.
+    let mut connection = Conn::new(Opts::from_url(&base)?).await?;
+    connection
+        .query_drop(
+            "DROP DATABASE IF EXISTS tapas_refused_source; CREATE DATABASE tapas_refused_source;
+             DROP DATABASE IF EXISTS tapas_refused_target; CREATE DATABASE tapas_refused_target;
+             CREATE TABLE tapas_refused_source.users (id BIGINT PRIMARY KEY, name VARCHAR(100));
+             CREATE TABLE tapas_refused_target.users (id BIGINT PRIMARY KEY);
+             SET SESSION cte_max_recursion_depth = 1000;
+             INSERT INTO tapas_refused_source.users
+               WITH RECURSIVE n (id) AS (SELECT 1 UNION ALL SELECT id + 1 FROM n WHERE id < 1000)
+               SELECT id, 'ana' FROM n;",
+        )
+        .await?;
+
+    let config: Config = "samplers:\n  - table: users\n".parse()?;
+    let error = tapas::run(
+        Plan::try_new(config, None)?,
+        &format!("{base}/tapas_refused_source"),
+        2,
+        &Output::Database(format!("{base}/tapas_refused_target")),
+        Options {
+            batch_rows: 1,
+            ..Options::default()
+        },
+    )
+    .await
+    .expect_err("the target has no name column");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("INSERT INTO `users` (`id`, `name`) VALUES"),
+        "names the statement: {message}"
+    );
+    assert!(
+        message.contains("Unknown column 'name'"),
+        "gives the target's reason: {message}"
+    );
+
+    connection
+        .query_drop("DROP DATABASE tapas_refused_source; DROP DATABASE tapas_refused_target")
+        .await?;
+    connection.disconnect().await?;
+    Ok(())
+}

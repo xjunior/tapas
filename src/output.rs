@@ -256,7 +256,10 @@ impl MySqlTarget {
         let (sender, mut receiver) = mpsc::channel::<Vec<u8>>(256);
         let task = tokio::spawn(async move {
             while let Some(statement) = receiver.recv().await {
-                connection.query_drop(statement.as_slice()).await?;
+                connection
+                    .query_drop(statement.as_slice())
+                    .await
+                    .with_context(|| format!("running {}", statement_head(&statement)))?;
             }
             Ok(connection)
         });
@@ -326,7 +329,10 @@ impl PostgresTarget {
             while let Some(statement) = receiver.recv().await {
                 // Postgres sends text, so its values, and the statements made of them, are UTF-8.
                 let statement = str::from_utf8(&statement).context("a statement isn't UTF-8")?;
-                client.batch_execute(statement).await?;
+                client
+                    .batch_execute(statement)
+                    .await
+                    .with_context(|| format!("running {}", statement_head(statement.as_bytes())))?;
             }
             Ok(client)
         });
@@ -362,6 +368,16 @@ impl PostgresTarget {
         }
         Ok(())
     }
+}
+
+/// The first line of an INSERT statement, which names its table and columns, followed by `…`
+/// for the rows, so a refused statement can be named without printing its values.
+fn statement_head(statement: &[u8]) -> String {
+    let end = statement
+        .iter()
+        .position(|&byte| byte == b'\n')
+        .unwrap_or(statement.len());
+    format!("{} …", String::from_utf8_lossy(&statement[..end]))
 }
 
 #[cfg(test)]

@@ -719,7 +719,7 @@ async fn write_batch(
             .output
             .send(sql::insert(context.source.dialect(), table, names, &rows))
             .await
-            .map_err(|_| anyhow!("the SQL writer stopped"))?;
+            .map_err(|_| anyhow!("the output stopped taking statements"))?;
     }
     Ok(())
 }

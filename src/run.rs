@@ -62,9 +62,10 @@ pub async fn run(
     let written = sink.finish(outcome).await;
     source.disconnect().await;
 
-    let rows = extracted?;
+    // A writer that fails stops taking statements, which fails the extraction too. Its own error
+    // says why, so it comes first.
     written?;
-    Ok(rows)
+    extracted
 }
 
 /// Works out what the plan's sanitize rules do to each table, from the source's columns. Reads
