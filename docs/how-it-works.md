@@ -10,9 +10,11 @@ This page is for people changing tapas.
 | `since` | Parses `--since` and turns a `time_column` into a SQL condition. |
 | `plan` | Validates the samplers, turns `deps` into samplers, finds cycles, and orders the tables. |
 | `sql` | Builds the queries and the `INSERT`s, and writes values as MySQL literals. |
+| `sanitize` | Works out what each table's sanitize rules do to its columns, and rewrites rows to match. |
+| `fake` | Makes fake values from a seed. |
 | `extract` | Runs the plan: schedules samplers, streams rows, and keeps the values children need. |
 | `output` | Writes the sample: a SQL file on its own thread, or a target database in one transaction. |
-| `run` | Connects to the source, and wires the plan, the extraction and the output together. |
+| `run` | Connects to the source, reads the columns the sanitize rules cover, and wires the plan, the extraction and the output together. |
 
 ## From config to plan
 
@@ -36,8 +38,8 @@ A table is **full** when one of its samplers takes every row. An `of` on a full 
 - Within a sampler, long value lists are split into chunks of `--chunk-size`. Several `of` lists become every
   combination of their chunks, so no row comes back from two queries.
 - Chunks run in parallel, except for a sampler with a `limit`, which runs them one after another until it has enough.
-- Rows stream into batches. A batch drops rows the table already has, keeps the values children need, and goes to the
-  writer as one `INSERT`.
+- Rows stream into batches. A batch drops rows the table already has, keeps the values children need, replaces
+  sanitized values, and goes to the writer as one `INSERT`.
 
 Duplicates are found by hashing each row with 128-bit xxh3. Tables with a single sampler, outside any cycle, skip that.
 
@@ -57,6 +59,17 @@ drops duplicates, since rounds can find the same row twice.
 
 A named sampler keeps the values of its own rows, separately from its table. They're recorded before duplicates are
 dropped, so a row another sampler already wrote still counts as this sampler's.
+
+## Sanitizing
+
+Before the output opens, `run` reads the columns of the tables that rules cover from `information_schema`, in one
+query. `Sanitizer::try_new` picks each column's rule and checks it against the column and against
+`Plan::references`. Each query then maps those columns to positions once (`Sanitizer::place`). Per row, only the
+sanitized values are rewritten, each in the buffer that held its literal.
+
+Duplicates and kept values are worked out before sanitizing, from the original values. A fake's seed is
+`xxh3_128(original value, lowercased)`, seeded by the run's seed mixed with the fake's name. The table and column
+aren't part of it, which is what makes the same value's fake the same everywhere.
 
 ## Writing
 

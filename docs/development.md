@@ -29,6 +29,7 @@ docker rm -f tapas-mysql
 | `tests/references.rs` | `deps` pulling in the rows it points at, whatever the parent's own filters. |
 | `tests/target.rs` | Writing straight into a target database, and refusing to write into the source. |
 | `tests/cycles.rs` | A table that follows itself, two tables that follow each other, and named samplers. |
+| `tests/sanitize.rs` | Every kind of replacement, fakes that agree across tables and runs, and refusing rules that break references. |
 
 Each one creates its own databases and drops them when it passes.
 
