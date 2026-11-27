@@ -230,10 +230,19 @@ impl Plan {
         for &index in &plan.samplers {
             let sampler = &self.samplers[index];
             columns.extend(sampler.of.keys().map(String::as_str));
+            columns.extend(sampler.deps.keys().map(String::as_str));
             if let Some(name) = &sampler.name
                 && let Some(kept) = self.named_keep.get(name)
             {
                 columns.extend(kept.iter().map(String::as_str));
+            }
+        }
+        // A dep on a table that takes every row pulls nothing in, so it isn't in `keep`.
+        for sampler in &self.samplers {
+            for parent in sampler.deps.values() {
+                if parent.table == table {
+                    columns.insert(&parent.column);
+                }
             }
         }
         columns
@@ -772,6 +781,10 @@ samplers:
   - table: orders
     deps:
       user_id: users.id
+  - table: countries
+  - table: addresses
+    deps:
+      country_code: countries.code
 "#,
         )?;
         let references = |table: &str| -> Vec<String> {
@@ -786,6 +799,9 @@ samplers:
         assert_eq!(references("projects"), ["id"]);
         assert_eq!(references("orders"), ["user_id"]);
         assert_eq!(references("users"), ["id"]);
+        // countries takes every row, so the dep pulls nothing in, but it's still a reference.
+        assert_eq!(references("addresses"), ["country_code"]);
+        assert_eq!(references("countries"), ["code"]);
         Ok(())
     }
 

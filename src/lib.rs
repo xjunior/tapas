@@ -7,6 +7,7 @@ pub mod fake;
 pub mod output;
 pub mod plan;
 mod run;
+pub mod sanitize;
 pub mod since;
 pub mod sql;
 

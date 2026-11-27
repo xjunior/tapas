@@ -13,15 +13,19 @@ use tokio::task::JoinSet;
 use xxhash_rust::xxh3;
 
 use crate::plan::Plan;
+use crate::sanitize::{Placed, Sanitizer, Scratch, Seed};
 use crate::sql::{self, Allowed, Dep, Kind};
 
-/// How the extraction splits its queries and statements.
+/// How the extraction runs: how it splits its queries and statements, and where fake values
+/// start from.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Options {
     /// Each `IN (...)` list holds at most this many values. It must be at least 1.
     pub chunk_size: usize,
     /// Each INSERT statement holds at most this many rows.
     pub batch_rows: usize,
+    /// Where fake values start from. Without one, each run picks its own.
+    pub sanitize_seed: Option<Seed>,
 }
 
 impl Default for Options {
@@ -29,6 +33,7 @@ impl Default for Options {
         Self {
             chunk_size: 5_000,
             batch_rows: 500,
+            sanitize_seed: None,
         }
     }
 }
@@ -98,14 +103,15 @@ struct Shared {
     pool: Pool,
     options: Options,
     output: mpsc::Sender<Vec<u8>>,
+    sanitizer: Sanitizer,
     tables: HashMap<String, Mutex<TableState>>,
     /// Keys of named samplers' own rows; only `keys` is used.
     named: HashMap<String, Mutex<TableState>>,
     started: Instant,
 }
 
-/// Extracts every sampler's rows, sending INSERT statements to `output`. Returns the number of
-/// rows written per table.
+/// Extracts every sampler's rows, sending INSERT statements to `output` with the values
+/// `sanitizer` covers replaced. Returns the number of rows written per table.
 ///
 /// # Panics
 ///
@@ -114,6 +120,7 @@ pub async fn extract(
     plan: Plan,
     pool: Pool,
     options: Options,
+    sanitizer: Sanitizer,
     output: mpsc::Sender<Vec<u8>>,
 ) -> Result<BTreeMap<String, u64>> {
     let tables: HashMap<String, Mutex<TableState>> = plan
@@ -138,6 +145,7 @@ pub async fn extract(
         pool,
         options,
         output,
+        sanitizer,
         tables,
         started: Instant::now(),
     });
@@ -449,6 +457,7 @@ async fn run_query(context: &Shared, index: usize, query: Vec<u8>) -> Result<u64
         table: kept_columns(&context.plan.tables[table].keep, &names, table)?,
         named,
     };
+    let sanitize = context.sanitizer.place(table, &names, &kinds)?;
 
     let mut returned = 0;
     let mut batch = Vec::with_capacity(context.options.batch_rows);
@@ -475,10 +484,10 @@ async fn run_query(context: &Shared, index: usize, query: Vec<u8>) -> Result<u64
 
         if batch.len() >= context.options.batch_rows {
             let full = mem::replace(&mut batch, Vec::with_capacity(context.options.batch_rows));
-            write_batch(context, table, &names, &keep, full).await?;
+            write_batch(context, table, &names, &keep, &sanitize, full).await?;
         }
     }
-    write_batch(context, table, &names, &keep, batch).await?;
+    write_batch(context, table, &names, &keep, &sanitize, batch).await?;
     Ok(returned)
 }
 
@@ -528,6 +537,7 @@ async fn write_batch(
     table: &str,
     names: &[String],
     keep: &Keep<'_>,
+    sanitize: &Placed<'_>,
     batch: Vec<Vec<Vec<u8>>>,
 ) -> Result<()> {
     // A named sampler's keys come from every row it returned, even rows another sampler of the
@@ -547,7 +557,7 @@ async fn write_batch(
         }
     }
 
-    let rows = {
+    let mut rows = {
         let dedupe = context.plan.tables[table].dedupe;
         let mut state = lock(&context.tables[table]);
         let mut rows = Vec::with_capacity(batch.len());
@@ -569,6 +579,14 @@ async fn write_batch(
         state.rows += rows.len() as u64;
         rows
     };
+
+    // After dedupe and keys, which need the original values, and only for rows that are written.
+    if !sanitize.is_empty() {
+        let mut scratch = Scratch::default();
+        for row in &mut rows {
+            sanitize.apply(row, &mut scratch);
+        }
+    }
 
     if !rows.is_empty() {
         context

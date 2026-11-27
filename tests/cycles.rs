@@ -107,6 +107,7 @@ async fn extracts_cycles_until_they_stop_growing() -> Result<()> {
         Options {
             chunk_size: 2,
             batch_rows: 3,
+            ..Options::default()
         },
     )
     .await?;

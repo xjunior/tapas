@@ -8,6 +8,8 @@ use mysql_async::{Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts};
 use crate::extract::{self, Options};
 use crate::output::{Outcome, Output, Sink};
 use crate::plan::Plan;
+use crate::sanitize::{ColumnInfo, Sanitizer, Seed};
+use crate::sql;
 
 /// Extracts the sample `plan` describes from `source_url` into `output`, a SQL file or a target
 /// database. Returns the number of rows written per table.
@@ -39,8 +41,16 @@ pub async fn run(
         .setup(vec!["SET SESSION TRANSACTION READ ONLY"]);
     let pool = Pool::new(connection_options);
 
+    // Checked before the output opens, so a bad rule leaves nothing behind.
+    let sanitizer = match sanitizer(&plan, &pool, options.sanitize_seed).await {
+        Ok(sanitizer) => sanitizer,
+        Err(error) => {
+            pool.disconnect().await.ok();
+            return Err(error);
+        }
+    };
     let (sink, sender) = Sink::open(output).await?;
-    let extracted = extract::extract(plan, pool.clone(), options, sender).await;
+    let extracted = extract::extract(plan, pool.clone(), options, sanitizer, sender).await;
     let outcome = if extracted.is_ok() {
         Outcome::Keep
     } else {
@@ -52,6 +62,36 @@ pub async fn run(
     let rows = extracted?;
     written?;
     Ok(rows)
+}
+
+/// Works out what the plan's sanitize rules do to each table, from the source's columns. Reads
+/// them in one query, and only when there are rules.
+async fn sanitizer(plan: &Plan, pool: &Pool, seed: Option<Seed>) -> Result<Sanitizer> {
+    use anyhow::Context;
+    use mysql_async::prelude::Queryable;
+
+    if plan.sanitize.is_empty() {
+        return Ok(Sanitizer::default());
+    }
+    let tables: Vec<&str> = if plan.sanitize.columns.is_empty() {
+        plan.sanitize.tables.keys().map(String::as_str).collect()
+    } else {
+        plan.tables.keys().map(String::as_str).collect()
+    };
+    let query = sql::columns_query(&tables);
+    let mut connection = pool.get_conn().await?;
+    let rows: Vec<(String, String, String, Option<u64>)> = connection
+        .query(query.as_slice())
+        .await
+        .context("reading the source's columns")?;
+    let mut columns: BTreeMap<String, Vec<ColumnInfo>> = BTreeMap::new();
+    for (table, name, data_type, max_chars) in rows {
+        columns
+            .entry(table)
+            .or_default()
+            .push(ColumnInfo::new(name, &data_type, max_chars));
+    }
+    Sanitizer::try_new(plan, &columns, seed.unwrap_or_else(Seed::random))
 }
 
 /// Returns whether two URLs point at the same database on the same server.

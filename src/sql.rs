@@ -139,6 +139,66 @@ pub fn push_literal(out: &mut Vec<u8>, kind: Kind, bytes: &[u8]) {
     }
 }
 
+/// Appends the value a non-NULL `literal` of this kind stands for to `out`: the reverse of
+/// `push_literal`.
+pub fn push_raw(out: &mut Vec<u8>, kind: Kind, literal: &[u8]) {
+    match kind {
+        Kind::Number => out.extend_from_slice(literal),
+        Kind::Binary => {
+            // X'…'
+            let hex = &literal[2..literal.len() - 1];
+            for [high, low] in hex.as_chunks::<2>().0 {
+                out.push(hex_value(*high) << 4 | hex_value(*low));
+            }
+        }
+        Kind::Text => {
+            let mut bytes = literal[1..literal.len() - 1].iter();
+            while let Some(&byte) = bytes.next() {
+                if byte != b'\\' {
+                    out.push(byte);
+                    continue;
+                }
+                let escaped = bytes
+                    .next()
+                    .expect("push_literal follows every backslash with the escaped byte");
+                out.push(match escaped {
+                    b'0' => 0,
+                    b'n' => b'\n',
+                    b'r' => b'\r',
+                    b'Z' => 0x1a,
+                    other => *other,
+                });
+            }
+        }
+    }
+}
+
+fn hex_value(digit: u8) -> u8 {
+    match digit {
+        b'0'..=b'9' => digit - b'0',
+        b'a'..=b'f' => digit - b'a' + 10,
+        _ => panic!("push_literal writes lowercase hex, not {digit}"),
+    }
+}
+
+/// Builds the query that lists the columns of `tables` in the current database: name, type, and
+/// the most characters a value holds.
+#[must_use]
+pub fn columns_query(tables: &[&str]) -> Vec<u8> {
+    let mut out = b"SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH \
+                    FROM information_schema.COLUMNS \
+                    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ("
+        .to_vec();
+    for (index, table) in tables.iter().enumerate() {
+        if index > 0 {
+            out.extend_from_slice(b", ");
+        }
+        push_literal(&mut out, Kind::Text, table.as_bytes());
+    }
+    out.extend_from_slice(b") ORDER BY TABLE_NAME, ORDINAL_POSITION");
+    out
+}
+
 /// The rows a dependency allows.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Allowed {
@@ -447,6 +507,41 @@ mod tests {
             "a parent with no values allows no rows, yet got {} queries",
             queries.len()
         );
+    }
+
+    #[test]
+    fn reads_literals_back() {
+        let values: [&[u8]; 6] = [
+            b"",
+            b"plain",
+            b"it's a\\b\n\r\0\x1a",
+            b"\\'",
+            &[0, 0xff, 0x10, b'\'', b'\\'],
+            "ção".as_bytes(),
+        ];
+        for kind in [Kind::Text, Kind::Binary] {
+            for value in values {
+                let mut raw = b"kept".to_vec();
+                push_raw(&mut raw, kind, &literal(kind, Some(value)));
+                assert_eq!(&raw[4..], value, "{kind:?} {value:?}");
+                assert_eq!(&raw[..4], b"kept", "push_raw appends");
+            }
+        }
+        let mut raw = Vec::new();
+        push_raw(&mut raw, Kind::Number, b"-12.5");
+        assert_eq!(raw, b"-12.5");
+    }
+
+    #[test]
+    fn asks_for_the_columns_of_tables() -> Result<(), Utf8Error> {
+        assert_eq!(
+            text(&columns_query(&["users", "it's"]))?,
+            "SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH \
+             FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ('users', 'it\\'s') \
+             ORDER BY TABLE_NAME, ORDINAL_POSITION"
+        );
+        Ok(())
     }
 
     #[test]
