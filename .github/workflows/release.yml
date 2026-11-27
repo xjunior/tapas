@@ -64,3 +64,32 @@ jobs:
           tar czf "$name.tar.gz" "$name"
           shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
       - run: gh release upload "$TAG" tapas-*.tar.gz tapas-*.tar.gz.sha256 --clobber
+
+  # Points the formula in xjunior/homebrew-tap at the new builds. Needs a HOMEBREW_TAP_TOKEN secret
+  # that can push to that repository.
+  homebrew:
+    needs: [release-please, build]
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
+    runs-on: ubuntu-24.04
+    env:
+      TAG: ${{ inputs.tag || needs.release-please.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+      TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+    steps:
+      # The script comes from main, so older tags can be published too.
+      - uses: actions/checkout@v4
+      - name: Update the formula
+        run: |
+          if [ -z "$TAP_TOKEN" ]; then
+            echo "::warning::HOMEBREW_TAP_TOKEN isn't set, so the Homebrew formula wasn't updated."
+            exit 0
+          fi
+          mkdir sums
+          gh release download "$TAG" --pattern '*.sha256' --dir sums
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/xjunior/homebrew-tap.git" tap
+          .github/scripts/homebrew-formula.sh "$TAG" sums > tap/Formula/tapas.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/tapas.rb
+          git diff --cached --quiet || { git commit -m "tapas ${TAG#v}"; git push; }
