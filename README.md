@@ -2,8 +2,8 @@
 
 Small plates of your production data.
 
-tapas pulls a sample out of a MySQL database and writes it to a SQL file or straight into another database, keeping
-every reference intact. You describe
+tapas pulls a sample out of a MySQL or Postgres database and writes it to a SQL file or straight into another database
+of the same kind, keeping every reference intact. You describe
 what to take in YAML; tapas works out the order, runs everything it can in parallel, and makes sure no row points at
 one that was left behind.
 
@@ -71,6 +71,13 @@ Or skip the file and pour it straight into another database:
 tapas tapas.yml --since '2 weeks' \
   --source mysql://user:password@host:3306/shop \
   --target mysql://root@localhost:3306/shop_dev
+```
+
+Postgres works the same way, with `postgres://` URLs:
+
+```sh
+tapas tapas.yml --since '2 weeks' --source postgres://user:password@host:5432/shop -o sample.sql
+psql shop_dev -f sample.sql
 ```
 
 Either way tapas writes `INSERT` statements only, so the target needs the schema already. Passwords can stay off the

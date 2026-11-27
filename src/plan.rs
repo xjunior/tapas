@@ -7,7 +7,7 @@ use anyhow::{Result, bail};
 
 use crate::config::{ColumnRef, Config, Sampler, Sanitize};
 use crate::since::Since;
-use crate::sql::{self, Allowed, Dep};
+use crate::sql::{self, Allowed, Dep, Dialect};
 
 /// Holds what the extraction needs to know about one table.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -254,8 +254,9 @@ impl Plan {
     ///
     /// Panics if `index` isn't a sampler of this plan.
     #[must_use]
-    pub fn time_filter(&self, index: usize) -> Option<String> {
-        self.since?.condition(&self.samplers[index].time_column)
+    pub fn time_filter(&self, index: usize, dialect: Dialect) -> Option<String> {
+        self.since?
+            .condition(dialect, &self.samplers[index].time_column)
     }
 
     /// Returns whether sampler `index` runs in rounds until its cycle stops growing.
@@ -294,7 +295,7 @@ impl Plan {
     /// Returns what `--plan` prints: each table in run order, with the queries its samplers will
     /// run.
     #[must_use]
-    pub fn describe(&self) -> String {
+    pub fn describe(&self, dialect: Dialect) -> String {
         let timed = self
             .samplers
             .iter()
@@ -376,9 +377,10 @@ impl Plan {
                     })
                     .collect();
                 // Every dep allows one placeholder value, so there's exactly one query.
-                let time_filter = self.time_filter(index);
+                let time_filter = self.time_filter(index, dialect);
                 let mut query =
-                    sql::sampler_queries(sampler, time_filter.as_deref(), &deps, 1).remove(0);
+                    sql::sampler_queries(dialect, sampler, time_filter.as_deref(), &deps, 1)
+                        .remove(0);
                 if let Some(limit) = sampler.limit {
                     query.extend_from_slice(format!(" LIMIT {limit}").as_bytes());
                 }
@@ -590,15 +592,15 @@ samplers:
     #[test]
     fn applies_since_to_samplers_with_a_time_column() -> Result<()> {
         let plan = plan_since(TIMED, "2 weeks")?;
-        assert_eq!(plan.time_filter(0), None);
+        assert_eq!(plan.time_filter(0, Dialect::MySql), None);
         assert_eq!(
-            plan.time_filter(1).as_deref(),
+            plan.time_filter(1, Dialect::MySql).as_deref(),
             Some(
                 "(`created_at` >= CURDATE() - INTERVAL 2 WEEK OR `updated_at` >= CURDATE() - INTERVAL 2 WEEK)"
             )
         );
         assert_eq!(
-            plan.time_filter(2).as_deref(),
+            plan.time_filter(2, Dialect::MySql).as_deref(),
             Some("`created_at` >= CURDATE() - INTERVAL 2 WEEK")
         );
         plan.check_since()
@@ -634,7 +636,7 @@ samplers:
     fn since_ever_keeps_every_row() -> Result<()> {
         let plan = plan_since(TIMED, "ever")?;
         let filters: Vec<Option<String>> = (0..plan.samplers.len())
-            .map(|index| plan.time_filter(index))
+            .map(|index| plan.time_filter(index, Dialect::MySql))
             .collect();
         assert!(
             filters.iter().all(|filter| filter.is_none()),
@@ -658,7 +660,7 @@ samplers:
 
     #[test]
     fn describes_the_plan() -> Result<()> {
-        let described = plan_since(TIMED, "2 weeks")?.describe();
+        let described = plan_since(TIMED, "2 weeks")?.describe(Dialect::MySql);
         assert!(
             described.contains("3 tables, 3 samplers, 2 with a time_column"),
             "{described}"
@@ -683,8 +685,21 @@ samplers:
             "{described}"
         );
 
-        let unset = plan(TIMED)?.describe();
+        let unset = plan(TIMED)?.describe(Dialect::MySql);
         assert!(unset.contains("a run would refuse to start"), "{unset}");
+        Ok(())
+    }
+
+    #[test]
+    fn describes_queries_as_the_source_runs_them() -> Result<()> {
+        let described = plan_since(TIMED, "2 weeks")?.describe(Dialect::Postgres);
+        assert!(
+            described.contains(
+                "SELECT * FROM \"orders\" WHERE \"created_at\" >= CURRENT_DATE - INTERVAL '2 WEEK' \
+                 AND \"user_id\" IN (<users.id>)"
+            ),
+            "{described}"
+        );
         Ok(())
     }
 
@@ -834,7 +849,7 @@ sanitize:
       retain_email: keep
 "#,
         )?
-        .describe();
+        .describe(Dialect::MySql);
         assert!(
             described.contains("sanitize: 2 rules for every table, from config\n"),
             "{described}"
@@ -850,7 +865,7 @@ sanitize:
             "orders has no rules of its own: {described}"
         );
 
-        let plain = plan(SHOP)?.describe();
+        let plain = plan(SHOP)?.describe(Dialect::MySql);
         assert!(!plain.contains("sanitize"), "{plain}");
         Ok(())
     }
@@ -1002,7 +1017,7 @@ samplers:
 
     #[test]
     fn describes_cycles() -> Result<()> {
-        let described = plan_since(PROJECTS, "2 weeks")?.describe();
+        let described = plan_since(PROJECTS, "2 weeks")?.describe(Dialect::MySql);
         assert!(
             described.contains("projects  (cycle: project_tasks, projects;"),
             "{described}"
@@ -1054,7 +1069,7 @@ samplers:
             !plan.allows_any(parent),
             "recent_write_offs only keeps recent rows"
         );
-        let described = plan.describe();
+        let described = plan.describe(Dialect::MySql);
         assert!(
             described.contains("`id` IN (<recent_write_offs.project_id>)"),
             "{described}"
@@ -1131,7 +1146,7 @@ samplers:
             orders.of
         );
         assert!(
-            plan.time_filter(orders_index).is_some(),
+            plan.time_filter(orders_index, Dialect::MySql).is_some(),
             "orders has a time_column and --since is given"
         );
         assert_eq!(

@@ -3,11 +3,11 @@ name = "tapas"
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.89"
-description = "Pulls a sample out of a MySQL database into a SQL file or another database, keeping every reference intact"
+description = "Pulls a sample out of a MySQL or Postgres database into a SQL file or another database, keeping every reference intact"
 readme = "README.md"
 license = "MIT"
 repository = "https://github.com/xjunior/tapas"
-keywords = ["mysql", "sampling", "test-data", "database", "cli"]
+keywords = ["mysql", "postgres", "sampling", "test-data", "database"]
 categories = ["command-line-utilities", "database"]
 publish = false
 
@@ -22,4 +22,6 @@ mysql_async = { version = "0.37.1", default-features = false, features = ["defau
 serde = { version = "1.0.229", features = ["derive"] }
 serde_yaml_ng = "0.10.0"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio-postgres = { version = "0.7.18", default-features = false, features = ["runtime"] }
+tokio-postgres-rustls = { version = "0.14.0", features = ["ring", "webpki-roots"] }
 xxhash-rust = { version = "0.8.21", features = ["xxh3"] }

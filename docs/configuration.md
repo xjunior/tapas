@@ -28,8 +28,8 @@ typo like `limt: 100` never goes unnoticed.
 | Key | Meaning |
 | --- | --- |
 | `table` | The table to read. A sampler with nothing else takes every row. |
-| `where` | A plain SQL condition, such as `created_at >= NOW() - INTERVAL 6 MONTH`. |
-| `order_by` | Plain SQL, such as `id DESC`. Mostly useful with `limit`. |
+| `where` | A plain SQL condition, such as `created_at >= NOW() - INTERVAL 6 MONTH`, in the source's SQL. |
+| `order_by` | Plain SQL, such as `id DESC`, in the source's SQL. Mostly useful with `limit`. |
 | `limit` | The most rows this sampler takes. |
 | `time_column` | A column, or a list of them, that `--since` filters on. |
 | `of` | `my_column: table.column`. Only rows that belong to rows already in the sample. |

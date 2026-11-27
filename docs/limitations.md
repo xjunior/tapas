@@ -19,7 +19,18 @@ What tapas doesn't do yet, or does in a way worth knowing about.
 ## Output
 
 - **No schema.** The target, file or database, needs every table already.
-- **MySQL only,** for both reading and the SQL it writes.
+- **The same kind of database in and out.** A MySQL source writes MySQL SQL and a Postgres source writes Postgres
+  SQL. tapas refuses a target of the other kind.
+- **One Postgres schema.** tapas reads and writes the tables of the connection's current schema. See
+  [`--source`](cli.md#--source) for how to pick it.
+- **Postgres targets need `session_replication_role`,** which takes a superuser or a grant. See
+  [`--target`](cli.md#--target).
+
+## Connections
+
+- **Postgres TLS only trusts public certificate authorities.** A server whose certificate comes from a private one,
+  such as Amazon RDS's or a self-signed one, fails the handshake, even with the default `sslmode=prefer`. tapas can't
+  take a CA file yet; only `?sslmode=disable` gets through, without TLS.
 
 ## Configuration
 

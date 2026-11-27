@@ -14,13 +14,15 @@ The binary lands in `target/release/tapas`. tapas needs Rust 1.89 or newer.
 cargo test
 ```
 
-The unit tests need nothing else. The end-to-end tests need a MySQL server they can create databases on, and skip
-themselves without one:
+The unit tests need nothing else. The end-to-end tests need a MySQL server and a Postgres server they can create
+databases and roles on. Each kind skips itself when its URL isn't set:
 
 ```sh
 docker run -d --name tapas-mysql -e MYSQL_ROOT_PASSWORD=tapas -p 3399:3306 mysql:8.4
-TAPAS_TEST_DATABASE_URL=mysql://root:tapas@127.0.0.1:3399 cargo test
-docker rm -f tapas-mysql
+docker run -d --name tapas-postgres -e POSTGRES_PASSWORD=tapas -p 5499:5432 postgres:18
+TAPAS_TEST_DATABASE_URL=mysql://root:tapas@127.0.0.1:3399 \
+  TAPAS_TEST_POSTGRES_URL=postgres://postgres:tapas@127.0.0.1:5499 cargo test
+docker rm -f tapas-mysql tapas-postgres
 ```
 
 | Test | Covers |
@@ -30,6 +32,7 @@ docker rm -f tapas-mysql
 | `tests/target.rs` | Writing straight into a target database, and refusing to write into the source. |
 | `tests/cycles.rs` | A table that follows itself, two tables that follow each other, and named samplers. |
 | `tests/sanitize.rs` | Every kind of replacement, fakes that agree across tables and runs, and refusing rules that break references. |
+| `tests/postgres.rs` | Postgres: values of many types that make the trip unchanged, cycles, sequences, sanitizing, and what a target user needs. |
 
 Each one creates its own databases and drops them when it passes.
 
@@ -81,6 +84,23 @@ samplers:
 ```sh
 cargo build --release
 /usr/bin/time -l target/release/tapas bench.yml --source mysql://root:tapas@127.0.0.1:3399/bench -o bench.sql
+```
+
+Postgres reads rows another way, so changes to its path need the same numbers from the same tables in Postgres:
+
+```sh
+docker run -d --name tapas-postgres -e POSTGRES_PASSWORD=tapas -p 5499:5432 postgres:18
+docker exec -i tapas-postgres psql -U postgres <<'SQL'
+CREATE DATABASE bench;
+\c bench
+CREATE TABLE users (id bigint PRIMARY KEY, name varchar(40), token bytea, bio text, created_at timestamp);
+CREATE TABLE orders (id bigint PRIMARY KEY, user_id bigint NOT NULL, total numeric(10,2));
+CREATE INDEX ON orders (user_id);
+INSERT INTO users SELECT i, 'user ' || i, decode(md5(i::text), 'hex'), repeat('bio ' || i || ' ', 6), now()
+  FROM generate_series(1, 1000000) i;
+INSERT INTO orders SELECT id * 2 + k, id, k FROM users, (VALUES (0), (1)) ks(k);
+SQL
+/usr/bin/time -l target/release/tapas bench.yml --source postgres://postgres:tapas@127.0.0.1:5499/bench -o bench.sql
 ```
 
 ## Commits

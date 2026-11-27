@@ -84,7 +84,7 @@ sanitize:
 | `users.email = 'bo@corp.com'` | `users.email = 'lena.ito.0w2kq7v9d1r5x@example.com'` |
 
 - **Case doesn't count.** `Ana@corp.com` and `ana@corp.com` get the same fake, as MySQL's usual collations treat them
-  as equal.
+  as equal. Postgres values get the same fakes as MySQL ones.
 - **Different values get different fakes.** `email` and `username` end with a part of the original value's hash, so
   two different emails practically never collide in a unique index.
 - **Only the same kind of fake lines up.** `first_name` of `Ana` and `name` of `Ana Lee` are unrelated.
@@ -158,12 +158,16 @@ when:
 
 ## How values are written
 
-Fixed and fake values are written as quoted strings. A template becomes SQL that MySQL runs as it loads the row,
-cut to the column's size:
+Fixed and fake values are written as quoted strings. A template becomes SQL that the database runs as it loads the
+row, cut to the column's size. A `NULL` column makes the whole value `NULL`:
 
 ```sql
+-- MySQL
 INSERT INTO `users` (`id`, `email`, `login`) VALUES
 (42, 'chen.okafor.1x8k2m0q9z3ab@example.org', LEFT(CONCAT('user_', 42), 40));
+-- Postgres
+INSERT INTO "users" ("id", "email", "login") OVERRIDING SYSTEM VALUE VALUES
+('42', 'chen.okafor.1x8k2m0q9z3ab@example.org', LEFT(CAST('user_' || '42' AS text), 40));
 ```
 
 Duplicate rows and the values children follow are worked out from the original values, before sanitizing. So
