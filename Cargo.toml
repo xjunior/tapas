@@ -2,6 +2,12 @@
 name = "tapas"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+description = "Pulls a sample out of a MySQL database into a SQL file, keeping every reference intact"
+readme = "README.md"
+keywords = ["mysql", "sampling", "test-data", "database", "cli"]
+categories = ["command-line-utilities", "database"]
+publish = false
 
 [dependencies]
 anyhow = "1.0.105"
