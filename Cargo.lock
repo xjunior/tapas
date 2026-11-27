@@ -1154,6 +1154,7 @@ dependencies = [
  "clap",
  "futures-util",
  "glob",
+ "indexmap",
  "mysql_async",
  "serde",
  "serde_yaml_ng",

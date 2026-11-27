@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
+use indexmap::IndexSet;
 use mysql_async::{Pool, Row, Value};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -36,28 +37,27 @@ impl Default for Options {
 /// just the values found since its last round.
 #[derive(Debug, Clone, Default)]
 struct KeySet {
-    seen: HashSet<Vec<u8>>,
-    order: Vec<Vec<u8>>,
+    // One copy of each value: an `IndexSet` both dedupes and keeps the order.
+    values: IndexSet<Vec<u8>>,
 }
 
 impl KeySet {
     fn insert(&mut self, value: &[u8]) {
-        if !self.seen.contains(value) {
-            self.seen.insert(value.to_vec());
-            self.order.push(value.to_vec());
+        if !self.values.contains(value) {
+            self.values.insert(value.to_vec());
         }
     }
 
     /// Returns how many distinct values were found so far.
     #[must_use]
     fn found(&self) -> usize {
-        self.order.len()
+        self.values.len()
     }
 
     /// Returns the values found after the first `from`, in the order they were found.
     #[must_use]
     fn values_from(&self, from: usize) -> Vec<Vec<u8>> {
-        self.order[from..].to_vec()
+        self.values.as_slice()[from..].iter().cloned().collect()
     }
 }
 
@@ -468,7 +468,8 @@ async fn run_query(context: &Shared, index: usize, query: Vec<u8>) -> Result<u64
         returned += 1;
 
         if batch.len() >= context.options.batch_rows {
-            write_batch(context, table, &names, &keep, mem::take(&mut batch)).await?;
+            let full = mem::replace(&mut batch, Vec::with_capacity(context.options.batch_rows));
+            write_batch(context, table, &names, &keep, full).await?;
         }
     }
     write_batch(context, table, &names, &keep, batch).await?;
@@ -575,12 +576,13 @@ async fn write_batch(
 
 #[must_use]
 fn row_hash(row: &[Vec<u8>]) -> u128 {
-    let mut buffer = Vec::new();
+    // Each value's length goes first, so moving a byte between columns changes the hash.
+    let mut hasher = xxh3::Xxh3::new();
     for literal in row {
-        buffer.extend_from_slice(&(literal.len() as u64).to_le_bytes());
-        buffer.extend_from_slice(literal);
+        hasher.update(&(literal.len() as u64).to_le_bytes());
+        hasher.update(literal);
     }
-    xxh3::xxh3_128(&buffer)
+    hasher.digest128()
 }
 
 fn log(context: &Shared, message: &str) {
