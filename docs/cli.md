@@ -9,7 +9,7 @@ tapas [OPTIONS] <CONFIGS>...
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--source <URL>` | | The database to read. Required unless `--plan`. |
-| `-o`, `--output <FILE>` | | The SQL file to write. This or `--target`, unless `--plan`. |
+| `-o`, `--output <FILE>` | | The SQL file to write, gzipped if `<FILE>` ends in `.gz`. This or `--target`, unless `--plan`. |
 | `--target <URL>` | | The database to write into. This or `--output`, unless `--plan`. |
 | `--since <SPAN>` | | How far back samplers with a `time_column` reach. |
 | `--plan` | | Print the plan and stop, without connecting. |
@@ -138,6 +138,16 @@ leaves something that looks complete. The file:
 - holds one multi-row `INSERT` per batch, with table names that carry no database;
 - ends with `SET FOREIGN_KEY_CHECKS=1`;
 - has no schema, `TRUNCATE` or `DROP`. Load it into a database with the schema and empty tables.
+
+When `<FILE>` ends in `.gz`, tapas gzips the SQL as it writes it, so the uncompressed SQL never touches the disk. MySQL
+can't read gzip itself; decompress on the way in:
+
+```sh
+tapas tapas.yml -o sample.sql.gz
+gunzip -c sample.sql.gz | mysql -h host -u user -p shop
+```
+
+tapas uses gzip's fastest level, so compressing doesn't slow the run. The file is about a quarter of the plain SQL's size.
 
 Progress goes to stderr. Each run ends with the row count per table, the total and the time taken.
 
