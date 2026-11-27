@@ -3,6 +3,7 @@
 
 pub mod config;
 pub mod extract;
+pub mod fake;
 pub mod output;
 pub mod plan;
 mod run;
