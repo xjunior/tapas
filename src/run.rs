@@ -64,3 +64,31 @@ fn same_database(first: &str, second: &str) -> bool {
         && first.tcp_port() == second.tcp_port()
         && first.db_name() == second.db_name()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn same_database_compares_host_port_and_database() {
+        assert!(
+            same_database(
+                "mysql://reader@db:3306/shop",
+                "mysql://root:secret@db:3306/shop"
+            ),
+            "users and passwords don't make it another database"
+        );
+        assert!(
+            !same_database("mysql://db:3306/shop", "mysql://db:3306/shop_dev"),
+            "another database on the same server is fine"
+        );
+        assert!(
+            !same_database("mysql://db:3306/shop", "mysql://db:3307/shop"),
+            "the same name on another port is another server"
+        );
+        assert!(
+            !same_database("not a url", "not a url"),
+            "URLs that don't parse fail later, with their own error"
+        );
+    }
+}

@@ -577,3 +577,30 @@ fn log(context: &Shared, message: &str) {
         context.started.elapsed().as_secs_f64()
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(values: &[&[u8]]) -> Vec<Vec<u8>> {
+        values.iter().map(|value| value.to_vec()).collect()
+    }
+
+    #[test]
+    fn row_hashes_match_for_equal_rows() {
+        assert_eq!(
+            row_hash(&row(&[b"1", b"'a'"])),
+            row_hash(&row(&[b"1", b"'a'"]))
+        );
+    }
+
+    #[test]
+    fn row_hashes_tell_where_each_value_ends() {
+        assert_ne!(
+            row_hash(&row(&[b"ab", b"c"])),
+            row_hash(&row(&[b"a", b"bc"])),
+            "moving a byte between columns makes another row"
+        );
+        assert_ne!(row_hash(&row(&[b"a", b""])), row_hash(&row(&[b"a"])));
+    }
+}

@@ -221,3 +221,53 @@ impl Target {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{env, process};
+
+    use super::*;
+
+    /// Writes `statement` through a new `SqlFile` at `path` and finishes it with `outcome`.
+    fn write_one(path: &Path, statement: &[u8], outcome: Outcome) -> Result<()> {
+        let (file, sender) = SqlFile::create(path)?;
+        sender.blocking_send(statement.to_vec())?;
+        drop(sender);
+        file.finish(outcome)
+    }
+
+    fn temp_path(name: &str) -> PathBuf {
+        env::temp_dir().join(format!("tapas-output-{name}-{}.sql", process::id()))
+    }
+
+    #[test]
+    fn sql_file_is_moved_into_place_when_kept() -> Result<()> {
+        let path = temp_path("keep");
+        write_one(&path, b"INSERT 1;\n", Outcome::Keep)?;
+
+        let written = fs::read(&path)?;
+        fs::remove_file(&path)?;
+        assert_eq!(written, [HEADER, b"INSERT 1;\n", FOOTER].concat());
+        let partial = PathBuf::from(format!("{}.partial", path.display()));
+        assert!(
+            !partial.exists(),
+            "{} should have been renamed",
+            partial.display()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sql_file_leaves_nothing_behind_when_discarded() -> Result<()> {
+        let path = temp_path("discard");
+        write_one(&path, b"INSERT 1;\n", Outcome::Discard)?;
+
+        let partial = PathBuf::from(format!("{}.partial", path.display()));
+        assert!(
+            !path.exists() && !partial.exists(),
+            "a failed run must not leave {} or its .partial",
+            path.display()
+        );
+        Ok(())
+    }
+}

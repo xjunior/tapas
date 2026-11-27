@@ -302,6 +302,36 @@ mod tests {
     }
 
     #[test]
+    fn writes_every_byte_as_two_hex_digits() -> Result<(), Utf8Error> {
+        use std::fmt::Write;
+
+        let bytes: Vec<u8> = (0..=u8::MAX).collect();
+        let mut expected = String::from("X'");
+        for byte in &bytes {
+            write!(expected, "{byte:02x}").expect("writing to a String doesn't fail");
+        }
+        expected.push('\'');
+        assert_eq!(text(&literal(Kind::Binary, Some(&bytes)))?, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn quotes_names_in_every_statement() -> Result<(), Utf8Error> {
+        let deps = [dep("we`ird", values(&["1"]))];
+        let queries = sampler_queries(&sampler("ta`ble", None, None), &deps, 10);
+        assert_eq!(
+            text(&queries[0])?,
+            "SELECT * FROM `ta``ble` WHERE `we``ird` IN (1)"
+        );
+        let columns = ["we`ird".to_string()];
+        assert_eq!(
+            text(&insert("ta`ble", &columns, &[vec![b"1".to_vec()]]))?,
+            "INSERT INTO `ta``ble` (`we``ird`) VALUES\n(1);\n"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn builds_a_plain_select() -> Result<(), Utf8Error> {
         let queries = sampler_queries(&sampler("countries", None, None), &[], 10);
         assert_eq!(queries.len(), 1);
