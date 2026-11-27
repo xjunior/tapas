@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.88"
 description = "Pulls a sample out of a MySQL database into a SQL file, keeping every reference intact"
 readme = "README.md"
+license = "MIT"
 keywords = ["mysql", "sampling", "test-data", "database", "cli"]
 categories = ["command-line-utilities", "database"]
 publish = false

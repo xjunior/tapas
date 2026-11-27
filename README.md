@@ -67,3 +67,7 @@ example in [tapas.example.yml](tapas.example.yml).
 - [Development](docs/development.md): building and testing.
 
 See [CHANGELOG.md](CHANGELOG.md) for what changed in each version.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
