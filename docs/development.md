@@ -36,10 +36,51 @@ Each one creates its own databases and drops them when it passes.
 
 ```sh
 cargo fmt --check
-cargo clippy --all-targets
+cargo clippy --all-targets -- -D warnings
 ```
 
-Both should be clean.
+Both must be clean; CI runs the same.
+
+## Rules
+
+Code, tests and docs follow the rules in [`.agents/rules/`](../.agents/rules): the style guide, tests first,
+cleanup, performance, design and documentation. `.claude` links to `.agents`, so Claude Code reads the same rules.
+
+## Benchmark
+
+Changes to the per-row paths need before and after numbers. Seed a sample big enough to measure:
+
+```sh
+docker run -d --name tapas-mysql -e MYSQL_ROOT_PASSWORD=tapas -p 3399:3306 mysql:8.4
+docker exec -i tapas-mysql mysql -uroot -ptapas <<'SQL'
+SET SESSION cte_max_recursion_depth = 1000000;
+CREATE DATABASE bench; USE bench;
+CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR(40), token VARBINARY(16), bio TEXT, created_at DATETIME);
+CREATE TABLE orders (id BIGINT PRIMARY KEY, user_id BIGINT NOT NULL, total DECIMAL(10,2), KEY (user_id));
+INSERT INTO users WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1000000)
+  SELECT i, CONCAT('user ', i), UNHEX(MD5(i)), REPEAT(CONCAT('bio ', i, ' '), 6), NOW() FROM n;
+INSERT INTO orders SELECT id * 2 + k, id, k FROM users, (SELECT 0 k UNION SELECT 1) ks;
+SQL
+```
+
+Then time a release build of each version with `/usr/bin/time -l` (macOS) or `/usr/bin/time -v` (Linux), and report
+the wall time and the maximum resident size:
+
+```yaml
+samplers:
+  - table: users
+    where: id % 2 = 0
+  - table: users
+    where: id % 3 = 0
+  - table: orders
+    of:
+      user_id: users.id
+```
+
+```sh
+cargo build --release
+/usr/bin/time -l target/release/tapas bench.yml --source mysql://root:tapas@127.0.0.1:3399/bench -o bench.sql
+```
 
 ## Commits
 
