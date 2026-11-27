@@ -1,0 +1,30 @@
+# Changelog
+
+Every notable change to tapas lands here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## Unreleased
+
+## 0.1.0 - 2026-11-27
+
+The first version: a sample of a MySQL database, written to a SQL file, with every reference intact.
+
+### Added
+
+- **Samplers** in YAML, each picking rows from one table with `where`, `order_by` and `limit`. A table can have as many
+  samplers as you like; its rows are each written once.
+- **`of`**, to take only the rows that belong to rows already in the sample.
+- **`deps`**, to bring along every row a table's rows point at, including rows that were themselves brought along.
+- **`name`**, so an `of` can follow one sampler's rows instead of its whole table's.
+- **Cycles.** Tables that lead to each other, or to themselves, are extracted in rounds until nothing new turns up.
+- **`time_column` and `--since`**, so one config gives each environment its own size: `--since '2 weeks'`,
+  `--since '3 months'`, or `--since ever`. `--since` is required once any sampler has a `time_column`.
+- **`--plan`**, which prints every table in run order with the queries its samplers will send, without connecting.
+- **Several config files at once**, with glob patterns tapas expands itself, `**` included.
+- **Parallel extraction.** Independent tables, samplers and `IN (...)` chunks all run at once, up to `--connections`.
+- **A SQL file you can trust.** It's written to `<file>.partial` and only renamed once the whole sample worked, with
+  foreign-key checks off so it loads in any order.
+- **Read-only connections** to the source, set up from `--source` or `TAPAS_SOURCE_URL`.
+- **Clear errors.** Unknown keys, missing parents, name clashes and conflicting `deps` are caught before anything runs,
+  and every error names the file and sampler it came from.
+
