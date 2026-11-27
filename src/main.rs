@@ -3,12 +3,14 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
 use tapas::sanitize::Seed;
+use tapas::sql::Dialect;
 use tapas::{Config, Options, Output, Plan, Since};
 
-/// Extracts a sample of a MySQL database that keeps its references intact.
+/// Extracts a sample of a MySQL or Postgres database that keeps its references intact.
 #[derive(Debug, Parser)]
 #[command(version)]
 struct Args {
@@ -22,11 +24,13 @@ struct Args {
     #[arg(long)]
     since: Option<Since>,
 
-    /// Print the tables and queries tapas would run, without connecting.
+    /// Print the tables and queries tapas would run, without connecting. The queries are written
+    /// for the --source database, or for MySQL without one.
     #[arg(long)]
     plan: bool,
 
-    /// Source database, as mysql://user:password@host:port/database.
+    /// Source database, as mysql://user:password@host:port/database or
+    /// postgres://user:password@host:port/database.
     #[arg(
         long,
         env = "TAPAS_SOURCE_URL",
@@ -39,7 +43,8 @@ struct Args {
     #[arg(long, short, required_unless_present_any = ["plan", "target"], conflicts_with = "target")]
     output: Option<PathBuf>,
 
-    /// Database to write the sample straight into, as mysql://user:password@host:port/database.
+    /// Database to write the sample straight into, of the same kind as the source, as
+    /// mysql://user:password@host:port/database or postgres://user:password@host:port/database.
     /// Its tables must exist. Everything goes in one transaction, committed only if the whole
     /// sample worked.
     #[arg(long, env = "TAPAS_TARGET_URL", hide_env_values = true)]
@@ -70,7 +75,12 @@ async fn main() -> Result<()> {
 
     let plan = Plan::try_new(Config::load(&args.configs)?, args.since)?;
     if args.plan {
-        print!("{}", plan.describe());
+        let dialect = match args.source.as_deref() {
+            Some(url) => Dialect::from_url(url)
+                .context("--source must start with mysql:// or postgres://")?,
+            None => Dialect::MySql,
+        };
+        print!("{}", plan.describe(dialect));
         return Ok(());
     }
 

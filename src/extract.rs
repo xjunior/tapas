@@ -1,21 +1,23 @@
 //! Runs a plan's samplers against the source and streams their rows out as INSERT statements.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::mem;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
+use std::{mem, pin};
 
 use anyhow::{Context, Result, anyhow, bail};
 use indexmap::IndexSet;
 use mysql_async::{Pool, Row, Value};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
+use tokio_postgres::SimpleQueryMessage;
 use xxhash_rust::xxh3;
 
 use crate::plan::Plan;
+use crate::postgres;
 use crate::sanitize::{Placed, Sanitizer, Scratch, Seed};
 use crate::source::Source;
-use crate::sql::{self, Allowed, Dep, Kind};
+use crate::sql::{self, Allowed, Dep, Dialect, Kind};
 
 /// How the extraction runs: how it splits its queries and statements, and where fake values
 /// start from.
@@ -382,8 +384,10 @@ fn current_deps(
 
 async fn run_sampler(context: &Arc<Shared>, index: usize, deps: Vec<Dep>) -> Result<()> {
     let sampler = &context.plan.samplers[index];
-    let time_filter = context.plan.time_filter(index);
+    let dialect = context.source.dialect();
+    let time_filter = context.plan.time_filter(index, dialect);
     let queries = sql::sampler_queries(
+        dialect,
         sampler,
         time_filter.as_deref(),
         &deps,
@@ -424,6 +428,7 @@ async fn run_sampler(context: &Arc<Shared>, index: usize, deps: Vec<Dep>) -> Res
 async fn run_query(context: &Shared, index: usize, query: Vec<u8>) -> Result<u64> {
     match &context.source {
         Source::MySql(pool) => run_mysql_query(context, index, pool, &query).await,
+        Source::Postgres(pool) => run_postgres_query(context, index, pool, &query).await,
     }
 }
 
@@ -471,7 +476,61 @@ async fn run_mysql_query(context: &Shared, index: usize, pool: &Pool, query: &[u
                     names[index]
                 ),
             };
-            literals.push(sql::literal(*kind, value));
+            literals.push(sql::literal(Dialect::MySql, *kind, value));
+        }
+        batcher.push(literals).await?;
+    }
+    batcher.finish().await
+}
+
+/// Runs a query on Postgres with the simple query protocol, which sends every value as text that
+/// reads back as the same value, whatever its type. So every value is written as a quoted literal,
+/// and Postgres turns it back into the column's type.
+async fn run_postgres_query(
+    context: &Shared,
+    index: usize,
+    pool: &postgres::Pool,
+    query: &[u8],
+) -> Result<u64> {
+    use futures_util::StreamExt;
+
+    let running = || format!("running {}", String::from_utf8_lossy(query));
+    // Built from the config and from values Postgres sent as text, so always UTF-8.
+    let query = str::from_utf8(query).with_context(running)?;
+    let connection = pool.get().await?;
+    let messages = connection
+        .simple_query_raw(query)
+        .await
+        .with_context(running)?;
+    let mut messages = pin::pin!(messages);
+
+    let columns = loop {
+        match messages.next().await {
+            Some(message) => {
+                if let SimpleQueryMessage::RowDescription(columns) =
+                    message.with_context(running)?
+                {
+                    break columns;
+                }
+            }
+            None => return Ok(0),
+        }
+    };
+    let names: Vec<String> = columns
+        .iter()
+        .map(|column| column.name().to_string())
+        .collect();
+    let kinds = vec![Kind::Text; names.len()];
+    let mut batcher = Batcher::try_new(context, index, &names, &kinds)?;
+
+    while let Some(message) = messages.next().await {
+        let SimpleQueryMessage::Row(row) = message.with_context(running)? else {
+            continue;
+        };
+        let mut literals = Vec::with_capacity(names.len());
+        for column in 0..names.len() {
+            let value = row.try_get(column)?.map(str::as_bytes);
+            literals.push(sql::literal(Dialect::Postgres, Kind::Text, value));
         }
         batcher.push(literals).await?;
     }
@@ -658,7 +717,7 @@ async fn write_batch(
     if !rows.is_empty() {
         context
             .output
-            .send(sql::insert(table, names, &rows))
+            .send(sql::insert(context.source.dialect(), table, names, &rows))
             .await
             .map_err(|_| anyhow!("the SQL writer stopped"))?;
     }

@@ -1,11 +1,12 @@
-//! Pulls a sample out of a MySQL database into a SQL file or another database, keeping every
-//! reference intact.
+//! Pulls a sample out of a MySQL or Postgres database into a SQL file or another database of the
+//! same kind, keeping every reference intact.
 
 pub mod config;
 pub mod extract;
 pub mod fake;
 pub mod output;
 pub mod plan;
+pub mod postgres;
 mod run;
 pub mod sanitize;
 pub mod since;

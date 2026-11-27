@@ -3,7 +3,7 @@
 use std::fmt::{self, Display, Formatter};
 use std::str::FromStr;
 
-use crate::sql;
+use crate::sql::{self, Dialect};
 
 /// How far back samplers with a `time_column` reach: `--since '3 months'`, or `--since ever`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -33,7 +33,7 @@ pub enum Unit {
 }
 
 impl Unit {
-    /// Returns the MySQL interval unit keyword.
+    /// Returns the interval unit keyword, which MySQL and Postgres share.
     #[must_use]
     fn sql(self) -> &'static str {
         match self {
@@ -71,17 +71,20 @@ impl Since {
     /// Returns the SQL condition for `columns`, or nothing for `Since::Ever`. Rows match when any
     /// of the columns falls on or after midnight of the cutoff day.
     #[must_use]
-    pub fn condition(&self, columns: &[String]) -> Option<String> {
+    pub fn condition(&self, dialect: Dialect, columns: &[String]) -> Option<String> {
         let Since::Back { amount, unit } = self else {
             return None;
         };
         if !self.narrows(columns) {
             return None;
         }
-        let cutoff = format!("CURDATE() - INTERVAL {amount} {}", unit.sql());
+        let cutoff = match dialect {
+            Dialect::MySql => format!("CURDATE() - INTERVAL {amount} {}", unit.sql()),
+            Dialect::Postgres => format!("CURRENT_DATE - INTERVAL '{amount} {}'", unit.sql()),
+        };
         let mut checks: Vec<String> = columns
             .iter()
-            .map(|column| format!("{} >= {cutoff}", sql::identifier(column)))
+            .map(|column| format!("{} >= {cutoff}", sql::identifier(dialect, column)))
             .collect();
         if checks.len() == 1 {
             return checks.pop();
@@ -193,19 +196,45 @@ mod tests {
     fn builds_conditions() -> Result<(), String> {
         let since: Since = "2 weeks".parse()?;
         assert_eq!(
-            since.condition(&["created_at".to_string()]).as_deref(),
+            since
+                .condition(Dialect::MySql, &["created_at".to_string()])
+                .as_deref(),
             Some("`created_at` >= CURDATE() - INTERVAL 2 WEEK")
         );
         assert_eq!(
             since
-                .condition(&["created_at".to_string(), "updated_at".to_string()])
+                .condition(
+                    Dialect::MySql,
+                    &["created_at".to_string(), "updated_at".to_string()]
+                )
                 .as_deref(),
             Some(
                 "(`created_at` >= CURDATE() - INTERVAL 2 WEEK OR `updated_at` >= CURDATE() - INTERVAL 2 WEEK)"
             )
         );
-        assert_eq!(Since::Ever.condition(&["created_at".to_string()]), None);
-        assert_eq!(since.condition(&[]), None);
+        assert_eq!(
+            Since::Ever.condition(Dialect::MySql, &["created_at".to_string()]),
+            None
+        );
+        assert_eq!(since.condition(Dialect::MySql, &[]), None);
+        Ok(())
+    }
+
+    #[test]
+    fn builds_postgres_conditions() -> Result<(), String> {
+        let since: Since = "3 months".parse()?;
+        assert_eq!(
+            since
+                .condition(
+                    Dialect::Postgres,
+                    &["created_at".to_string(), "updatedAt".to_string()]
+                )
+                .as_deref(),
+            Some(
+                "(\"created_at\" >= CURRENT_DATE - INTERVAL '3 MONTH' \
+                 OR \"updatedAt\" >= CURRENT_DATE - INTERVAL '3 MONTH')"
+            )
+        );
         Ok(())
     }
 }

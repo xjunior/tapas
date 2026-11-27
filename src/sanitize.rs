@@ -16,7 +16,7 @@ use xxhash_rust::xxh3;
 use crate::config::{Replacement, Rule, TemplatePart};
 use crate::fake::Fake;
 use crate::plan::Plan;
-use crate::sql::{self, Kind};
+use crate::sql::{self, Dialect, Kind};
 
 /// Where fake values start from. The same seed turns the same original value into the same fake
 /// one, run after run.
@@ -55,8 +55,8 @@ pub struct ColumnInfo {
 }
 
 impl ColumnInfo {
-    /// Describes a column from `information_schema.COLUMNS`: its `DATA_TYPE`, such as `varchar`,
-    /// and its `CHARACTER_MAXIMUM_LENGTH`.
+    /// Describes a column from `information_schema.COLUMNS`: its `DATA_TYPE`, such as `varchar`
+    /// or Postgres's `double precision`, and its `CHARACTER_MAXIMUM_LENGTH`.
     #[must_use]
     pub fn new(name: String, data_type: &str, max_chars: Option<u64>) -> Self {
         let numeric = matches!(
@@ -73,6 +73,9 @@ impl ColumnInfo {
                 | "double"
                 | "year"
                 | "bit"
+                // Postgres's names that MySQL doesn't share.
+                | "real"
+                | "double precision"
         );
         Self {
             name,
@@ -112,6 +115,7 @@ struct Sanitized {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Sanitizer {
     seed: Seed,
+    dialect: Dialect,
     tables: BTreeMap<String, Vec<Sanitized>>,
 }
 
@@ -120,6 +124,7 @@ impl Default for Sanitizer {
     fn default() -> Self {
         Self {
             seed: Seed(0),
+            dialect: Dialect::MySql,
             tables: BTreeMap::new(),
         }
     }
@@ -127,11 +132,12 @@ impl Default for Sanitizer {
 
 impl Sanitizer {
     /// Works out what the plan's rules do to each of its tables, given the source's `columns`
-    /// per table. Fails on a rule that names a column the table lacks, would break a reference,
+    /// per table and the `dialect` it speaks. Fails on a rule that names a column the table lacks, would break a reference,
     /// or writes something the column can't hold.
     pub fn try_new(
         plan: &Plan,
         columns: &BTreeMap<String, Vec<ColumnInfo>>,
+        dialect: Dialect,
         seed: Seed,
     ) -> Result<Self> {
         let mut tables = BTreeMap::new();
@@ -150,6 +156,7 @@ impl Sanitizer {
                 continue;
             };
             let sanitized = resolve(
+                dialect,
                 table,
                 own,
                 &plan.sanitize.columns,
@@ -160,7 +167,11 @@ impl Sanitizer {
                 tables.insert(table.clone(), sanitized);
             }
         }
-        Ok(Self { seed, tables })
+        Ok(Self {
+            seed,
+            dialect,
+            tables,
+        })
     }
 
     /// Finds `table`'s sanitized columns among a query's column `names`, whose values are
@@ -203,12 +214,16 @@ impl Sanitizer {
                 max_chars: sanitized.max_chars,
             });
         }
-        Ok(Placed { columns })
+        Ok(Placed {
+            dialect: self.dialect,
+            columns,
+        })
     }
 }
 
 /// Works out the sanitized columns of `table`, from its `own` rules and the `global` ones.
 fn resolve(
+    dialect: Dialect,
     table: &str,
     own: &[Rule],
     global: &[Rule],
@@ -273,7 +288,7 @@ fn resolve(
                          {max}"
                     );
                 }
-                Action::Literal(sql::literal(Kind::Text, Some(text.as_bytes())))
+                Action::Literal(sql::literal(dialect, Kind::Text, Some(text.as_bytes())))
             }
             Replacement::Fake(fake) => {
                 if column.numeric && !fake.is_digits() {
@@ -289,7 +304,7 @@ fn resolve(
                 for part in &template.parts {
                     pieces.push(match part {
                         TemplatePart::Text(text) => {
-                            Piece::Literal(sql::literal(Kind::Text, Some(text.as_bytes())))
+                            Piece::Literal(sql::literal(dialect, Kind::Text, Some(text.as_bytes())))
                         }
                         TemplatePart::Column(wanted) => {
                             let Some(found) = columns
@@ -371,6 +386,7 @@ fn origin(rule: &Rule, table: Option<&str>) -> String {
 /// A table's sanitized columns, found among one query's columns.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Placed<'a> {
+    dialect: Dialect,
     columns: Vec<PlacedColumn<'a>>,
 }
 
@@ -416,7 +432,7 @@ impl Placed<'_> {
             // Taken out, so a template can read the row's other values while this one is built.
             let mut value = mem::take(&mut row[column.position]);
             if !is_blank(&value) {
-                write_replacement(column, &mut value, row, scratch);
+                write_replacement(self.dialect, column, &mut value, row, scratch);
             }
             row[column.position] = value;
         }
@@ -431,6 +447,7 @@ fn is_blank(literal: &[u8]) -> bool {
 
 /// Replaces `value`, the literal of `column` in `row`, with its sanitized literal.
 fn write_replacement(
+    dialect: Dialect,
     column: &PlacedColumn<'_>,
     value: &mut Vec<u8>,
     row: &[Vec<u8>],
@@ -443,9 +460,10 @@ fn write_replacement(
         }
         PlacedAction::Fake { fake, seed } => {
             scratch.raw.clear();
-            sql::push_raw(&mut scratch.raw, column.kind, value);
+            sql::push_raw(&mut scratch.raw, dialect, column.kind, value);
             // MySQL's usual collations ignore case, so `Ana@x.com` and `ana@x.com` are the same
-            // value to it, and get the same fake.
+            // value to it, and get the same fake. Postgres values are treated alike, so a value's
+            // fake doesn't depend on which database it came from.
             scratch.raw.make_ascii_lowercase();
             scratch.text.clear();
             fake.write(
@@ -457,24 +475,29 @@ fn write_replacement(
                 scratch.text.truncate(max);
             }
             value.clear();
-            sql::push_literal(value, Kind::Text, scratch.text.as_bytes());
+            sql::push_literal(value, dialect, Kind::Text, scratch.text.as_bytes());
         }
         PlacedAction::Template(pieces) => {
             value.clear();
             if column.max_chars.is_some() {
                 value.extend_from_slice(b"LEFT(");
             }
-            value.extend_from_slice(b"CONCAT(");
+            let (open, separator, close): (&[u8], &[u8], &[u8]) = match dialect {
+                Dialect::MySql => (b"CONCAT(", b", ", b")"),
+                // Postgres's CONCAT skips NULLs; `||` turns them into NULL, as MySQL's CONCAT does.
+                Dialect::Postgres => (b"CAST(", b" || ", b" AS text)"),
+            };
+            value.extend_from_slice(open);
             for (index, piece) in pieces.iter().enumerate() {
                 if index > 0 {
-                    value.extend_from_slice(b", ");
+                    value.extend_from_slice(separator);
                 }
                 match piece {
                     PlacedPiece::Literal(literal) => value.extend_from_slice(literal),
                     PlacedPiece::Column(position) => value.extend_from_slice(&row[*position]),
                 }
             }
-            value.push(b')');
+            value.extend_from_slice(close);
             if let Some(max) = column.max_chars {
                 // Writing to a `Vec` can't fail.
                 let _ = write!(value, ", {max})");
@@ -578,7 +601,7 @@ sanitize:
                 vec![number("id"), text("email_address", 255), text("notes", 255)],
             ),
         ]);
-        Sanitizer::try_new(&plan(PEOPLE)?, &columns, seed)
+        Sanitizer::try_new(&plan(PEOPLE)?, &columns, Dialect::MySql, seed)
     }
 
     #[test]
@@ -679,7 +702,7 @@ sanitize:
             "t".to_string(),
             vec![number("a"), text("b", 20), text("c", 20)],
         )]);
-        let sanitizer = Sanitizer::try_new(&config, &columns, seed())?;
+        let sanitizer = Sanitizer::try_new(&config, &columns, Dialect::MySql, seed())?;
         let names = ["a".to_string(), "b".to_string(), "c".to_string()];
         let placed = sanitizer.place("t", &names, &[Kind::Number, Kind::Text, Kind::Binary])?;
         // 123456789 as a number, as text, and as binary.
@@ -698,7 +721,7 @@ sanitize:
         let config =
             plan("samplers:\n  - table: t\nsanitize:\n  columns:\n    email: { fake: email }\n")?;
         let columns = BTreeMap::from([("t".to_string(), vec![text("email", 6)])]);
-        let sanitizer = Sanitizer::try_new(&config, &columns, seed())?;
+        let sanitizer = Sanitizer::try_new(&config, &columns, Dialect::MySql, seed())?;
         let rows = sanitize(&sanitizer, "t", &["email"], &[&["'someone@x.com'"]])?;
         assert_eq!(
             rows[0][0].len(),
@@ -710,7 +733,8 @@ sanitize:
 
     fn error(yaml: &str, columns: Vec<ColumnInfo>) -> String {
         let columns = BTreeMap::from([("users".to_string(), columns)]);
-        let result = plan(yaml).and_then(|plan| Sanitizer::try_new(&plan, &columns, seed()));
+        let result =
+            plan(yaml).and_then(|plan| Sanitizer::try_new(&plan, &columns, Dialect::MySql, seed()));
         match result {
             Ok(sanitizer) => panic!("expected an error, got {sanitizer:?}"),
             Err(error) => error.to_string(),
@@ -801,7 +825,8 @@ sanitize:
         }
         let plan = Plan::try_new(config, None)?;
         let columns = BTreeMap::from([("users".to_string(), vec![text("email", 255)])]);
-        let error = Sanitizer::try_new(&plan, &columns, seed()).expect_err("an unordered clash");
+        let error = Sanitizer::try_new(&plan, &columns, Dialect::MySql, seed())
+            .expect_err("an unordered clash");
         assert_eq!(
             error.to_string(),
             "users.email matches `*mail*` in a.yml and `e*` in b.yml; name the column in one of \
@@ -815,7 +840,7 @@ sanitize:
         let plan = plan(
             "samplers:\n  - table: users\nsanitize:\n  tables:\n    users:\n      email: null\n",
         )?;
-        let error = Sanitizer::try_new(&plan, &BTreeMap::new(), seed())
+        let error = Sanitizer::try_new(&plan, &BTreeMap::new(), Dialect::MySql, seed())
             .expect_err("the source has no users");
         assert_eq!(
             error.to_string(),
@@ -833,5 +858,63 @@ sanitize:
             Err("the seed can't be empty".to_string())
         );
         assert_ne!(Seed::random(), Seed::random());
+    }
+
+    #[test]
+    fn writes_postgres_replacements() -> Result<()> {
+        let config = plan(
+            "samplers:\n  - table: users\nsanitize:\n  columns:\n    \
+             login: { template: \"it's_{id}\" }\n    bio: { value: \"it's\" }\n    \
+             email: { fake: email }\n",
+        )?;
+        let columns = BTreeMap::from([(
+            "users".to_string(),
+            vec![
+                number("id"),
+                text("login", 40),
+                text("bio", 100),
+                text("email", 100),
+            ],
+        )]);
+        let names = ["id", "login", "bio", "email"];
+        let postgres = Sanitizer::try_new(&config, &columns, Dialect::Postgres, seed())?;
+        let rows = sanitize(
+            &postgres,
+            "users",
+            &names,
+            &[
+                &["'7'", "'x'", "'x'", "'it''s@x.com'"],
+                &["'8'", "'x'", "'x'", "''"],
+            ],
+        )?;
+        assert_eq!(
+            rows[0][1], "LEFT(CAST('it''s_' || '7' AS text), 40)",
+            "|| keeps a NULL piece's NULL, as MySQL's CONCAT does"
+        );
+        assert_eq!(rows[0][2], "'it''s'");
+        assert_eq!(rows[1][3], "''", "empty values stay empty");
+
+        let mysql = Sanitizer::try_new(&config, &columns, Dialect::MySql, seed())?;
+        let mysql_rows = sanitize(
+            &mysql,
+            "users",
+            &names,
+            &[&["7", "'x'", "'x'", r"'it\'s@x.com'"]],
+        )?;
+        assert_eq!(
+            rows[0][3], mysql_rows[0][3],
+            "a value gets the same fake whichever database it comes from"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn knows_postgres_numeric_types() {
+        for data_type in ["integer", "numeric", "real", "double precision"] {
+            let column = ColumnInfo::new("n".to_string(), data_type, None);
+            assert!(column.numeric, "{data_type} holds numbers");
+        }
+        let column = ColumnInfo::new("s".to_string(), "character varying", Some(20));
+        assert!(!column.numeric, "character varying holds text");
     }
 }

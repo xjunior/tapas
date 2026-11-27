@@ -1,5 +1,7 @@
 //! Builds the SQL tapas runs and writes: SELECTs for samplers, literals, and INSERTs.
 
+use std::fmt::{self, Display, Formatter};
+
 use mysql_async::consts::ColumnType;
 
 use crate::config::Sampler;
@@ -12,22 +14,60 @@ pub const NULL: &[u8] = b"NULL";
 
 const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 
+/// The SQL a database speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dialect {
+    /// MySQL: `` `name` ``, `'it\'s'`, `X'00ff'`.
+    MySql,
+    /// PostgreSQL: `"name"`, `'it''s'`, `'\x00ff'`.
+    Postgres,
+}
+
+impl Dialect {
+    /// Picks the dialect of the database at `url` from its scheme: `mysql://`, or `postgres://`
+    /// or `postgresql://`.
+    #[must_use]
+    pub fn from_url(url: &str) -> Option<Self> {
+        let (scheme, _) = url.split_once("://")?;
+        match scheme {
+            "mysql" => Some(Dialect::MySql),
+            "postgres" | "postgresql" => Some(Dialect::Postgres),
+            _ => None,
+        }
+    }
+}
+
+impl Display for Dialect {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Dialect::MySql => "MySQL",
+            Dialect::Postgres => "Postgres",
+        })
+    }
+}
+
 /// Quotes a table or column name.
 #[must_use]
-pub fn identifier(name: &str) -> String {
-    format!("`{}`", name.replace('`', "``"))
+pub fn identifier(dialect: Dialect, name: &str) -> String {
+    let mut out = Vec::with_capacity(name.len() + 2);
+    push_identifier(&mut out, dialect, name);
+    String::from_utf8(out).expect("quoting only adds ASCII to a str")
 }
 
 /// Appends `name` to `out`, quoted as a table or column name.
-fn push_identifier(out: &mut Vec<u8>, name: &str) {
-    out.push(b'`');
+fn push_identifier(out: &mut Vec<u8>, dialect: Dialect, name: &str) {
+    let quote = match dialect {
+        Dialect::MySql => b'`',
+        Dialect::Postgres => b'"',
+    };
+    out.push(quote);
     for &byte in name.as_bytes() {
-        if byte == b'`' {
-            out.push(b'`');
+        if byte == quote {
+            out.push(quote);
         }
         out.push(byte);
     }
-    out.push(b'`');
+    out.push(quote);
 }
 
 /// How a column's values are written back as SQL.
@@ -35,9 +75,9 @@ fn push_identifier(out: &mut Vec<u8>, name: &str) {
 pub enum Kind {
     /// Values are written as is: `42`, `3.14`.
     Number,
-    /// Values are quoted and escaped: `'it\'s'`.
+    /// Values are quoted and escaped: `'it\'s'`, or `'it''s'` for Postgres.
     Text,
-    /// Values are written as hex: `X'00ff'`.
+    /// Values are written as hex: `X'00ff'`, or `'\x00ff'` for Postgres.
     Binary,
 }
 
@@ -93,34 +133,40 @@ impl Kind {
 
 /// Writes a value read with the text protocol as a SQL literal.
 #[must_use]
-pub fn literal(kind: Kind, value: Option<&[u8]>) -> Vec<u8> {
+pub fn literal(dialect: Dialect, kind: Kind, value: Option<&[u8]>) -> Vec<u8> {
     let Some(bytes) = value else {
         return NULL.to_vec();
     };
     let capacity = match kind {
         Kind::Number => bytes.len(),
         Kind::Text => bytes.len() + 2,
-        Kind::Binary => bytes.len() * 2 + 3,
+        Kind::Binary => bytes.len() * 2 + 4,
     };
     let mut out = Vec::with_capacity(capacity);
-    push_literal(&mut out, kind, bytes);
+    push_literal(&mut out, dialect, kind, bytes);
     out
 }
 
 /// Appends `bytes`, a value read with the text protocol, to `out` as a SQL literal.
-pub fn push_literal(out: &mut Vec<u8>, kind: Kind, bytes: &[u8]) {
-    match kind {
-        Kind::Number => out.extend_from_slice(bytes),
-        Kind::Binary => {
-            out.reserve(bytes.len() * 2 + 3);
-            out.extend_from_slice(b"X'");
-            for &byte in bytes {
-                out.push(HEX_DIGITS[usize::from(byte >> 4)]);
-                out.push(HEX_DIGITS[usize::from(byte & 0x0f)]);
+pub fn push_literal(out: &mut Vec<u8>, dialect: Dialect, kind: Kind, bytes: &[u8]) {
+    match (dialect, kind) {
+        (Dialect::MySql | Dialect::Postgres, Kind::Number) => out.extend_from_slice(bytes),
+        (Dialect::MySql, Kind::Binary) => push_hex(out, b"X'", bytes),
+        (Dialect::Postgres, Kind::Binary) => push_hex(out, b"'\\x", bytes),
+        // Only quotes need escaping: tapas sets standard_conforming_strings, so a backslash is
+        // a plain character.
+        (Dialect::Postgres, Kind::Text) => {
+            out.reserve(bytes.len() + 2);
+            out.push(b'\'');
+            for (index, part) in bytes.split(|&byte| byte == b'\'').enumerate() {
+                if index > 0 {
+                    out.extend_from_slice(b"''");
+                }
+                out.extend_from_slice(part);
             }
             out.push(b'\'');
         }
-        Kind::Text => {
+        (Dialect::MySql, Kind::Text) => {
             out.reserve(bytes.len() + 2);
             out.push(b'\'');
             for &byte in bytes {
@@ -139,19 +185,37 @@ pub fn push_literal(out: &mut Vec<u8>, kind: Kind, bytes: &[u8]) {
     }
 }
 
+/// Appends `bytes` to `out` as hex digits between `prefix` and a closing quote.
+fn push_hex(out: &mut Vec<u8>, prefix: &[u8], bytes: &[u8]) {
+    out.reserve(prefix.len() + bytes.len() * 2 + 1);
+    out.extend_from_slice(prefix);
+    for &byte in bytes {
+        out.push(HEX_DIGITS[usize::from(byte >> 4)]);
+        out.push(HEX_DIGITS[usize::from(byte & 0x0f)]);
+    }
+    out.push(b'\'');
+}
+
 /// Appends the value a non-NULL `literal` of this kind stands for to `out`: the reverse of
 /// `push_literal`.
-pub fn push_raw(out: &mut Vec<u8>, kind: Kind, literal: &[u8]) {
-    match kind {
-        Kind::Number => out.extend_from_slice(literal),
-        Kind::Binary => {
-            // X'…'
-            let hex = &literal[2..literal.len() - 1];
-            for [high, low] in hex.as_chunks::<2>().0 {
-                out.push(hex_value(*high) << 4 | hex_value(*low));
+pub fn push_raw(out: &mut Vec<u8>, dialect: Dialect, kind: Kind, literal: &[u8]) {
+    match (dialect, kind) {
+        (Dialect::MySql | Dialect::Postgres, Kind::Number) => out.extend_from_slice(literal),
+        // X'…'
+        (Dialect::MySql, Kind::Binary) => push_unhex(out, &literal[2..literal.len() - 1]),
+        // '\x…'
+        (Dialect::Postgres, Kind::Binary) => push_unhex(out, &literal[3..literal.len() - 1]),
+        (Dialect::Postgres, Kind::Text) => {
+            let mut bytes = literal[1..literal.len() - 1].iter();
+            while let Some(&byte) = bytes.next() {
+                out.push(byte);
+                if byte == b'\'' {
+                    // push_literal doubles every quote; skip the second one.
+                    bytes.next();
+                }
             }
         }
-        Kind::Text => {
+        (Dialect::MySql, Kind::Text) => {
             let mut bytes = literal[1..literal.len() - 1].iter();
             while let Some(&byte) = bytes.next() {
                 if byte != b'\\' {
@@ -173,6 +237,12 @@ pub fn push_raw(out: &mut Vec<u8>, kind: Kind, literal: &[u8]) {
     }
 }
 
+fn push_unhex(out: &mut Vec<u8>, hex: &[u8]) {
+    for [high, low] in hex.as_chunks::<2>().0 {
+        out.push(hex_value(*high) << 4 | hex_value(*low));
+    }
+}
+
 fn hex_value(digit: u8) -> u8 {
     match digit {
         b'0'..=b'9' => digit - b'0',
@@ -184,18 +254,29 @@ fn hex_value(digit: u8) -> u8 {
 /// Builds the query that lists the columns of `tables` in the current database: name, type, and
 /// the most characters a value holds.
 #[must_use]
-pub fn columns_query(tables: &[&str]) -> Vec<u8> {
-    let mut out = b"SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH \
-                    FROM information_schema.COLUMNS \
-                    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ("
-        .to_vec();
+pub fn columns_query(dialect: Dialect, tables: &[&str]) -> Vec<u8> {
+    let (start, end): (&[u8], &[u8]) = match dialect {
+        Dialect::MySql => (
+            b"SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH \
+              FROM information_schema.COLUMNS \
+              WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN (",
+            b") ORDER BY TABLE_NAME, ORDINAL_POSITION",
+        ),
+        Dialect::Postgres => (
+            b"SELECT table_name, column_name, data_type, character_maximum_length \
+              FROM information_schema.columns \
+              WHERE table_schema = current_schema() AND table_name IN (",
+            b") ORDER BY table_name, ordinal_position",
+        ),
+    };
+    let mut out = start.to_vec();
     for (index, table) in tables.iter().enumerate() {
         if index > 0 {
             out.extend_from_slice(b", ");
         }
-        push_literal(&mut out, Kind::Text, table.as_bytes());
+        push_literal(&mut out, dialect, Kind::Text, table.as_bytes());
     }
-    out.extend_from_slice(b") ORDER BY TABLE_NAME, ORDINAL_POSITION");
+    out.extend_from_slice(end);
     out
 }
 
@@ -227,6 +308,7 @@ pub struct Dep {
 /// Panics if `chunk_size` is 0.
 #[must_use]
 pub fn sampler_queries(
+    dialect: Dialect,
     sampler: &Sampler,
     time_filter: Option<&str>,
     deps: &[Dep],
@@ -238,7 +320,7 @@ pub fn sampler_queries(
         match allowed {
             Allowed::AnyValue => {
                 let mut condition = Vec::with_capacity(column.len() + 14);
-                push_identifier(&mut condition, column);
+                push_identifier(&mut condition, dialect, column);
                 condition.extend_from_slice(b" IS NOT NULL");
                 for conditions in &mut combinations {
                     conditions.push(condition.clone());
@@ -248,7 +330,7 @@ pub fn sampler_queries(
             Allowed::Values(values) => {
                 let chunks: Vec<Vec<u8>> = values
                     .chunks(chunk_size)
-                    .map(|chunk| in_list(column, chunk))
+                    .map(|chunk| in_list(dialect, column, chunk))
                     .collect();
                 combinations = combinations
                     .into_iter()
@@ -266,15 +348,15 @@ pub fn sampler_queries(
 
     combinations
         .into_iter()
-        .map(|conditions| select(sampler, time_filter, conditions))
+        .map(|conditions| select(dialect, sampler, time_filter, conditions))
         .collect()
 }
 
 #[must_use]
-fn in_list(column: &str, values: &[Vec<u8>]) -> Vec<u8> {
+fn in_list(dialect: Dialect, column: &str, values: &[Vec<u8>]) -> Vec<u8> {
     let value_bytes: usize = values.iter().map(|value| value.len() + 2).sum();
     let mut out = Vec::with_capacity(column.len() + value_bytes + 8);
-    push_identifier(&mut out, column);
+    push_identifier(&mut out, dialect, column);
     out.extend_from_slice(b" IN (");
     for (index, value) in values.iter().enumerate() {
         if index > 0 {
@@ -287,7 +369,12 @@ fn in_list(column: &str, values: &[Vec<u8>]) -> Vec<u8> {
 }
 
 #[must_use]
-fn select(sampler: &Sampler, time_filter: Option<&str>, dep_conditions: Vec<Vec<u8>>) -> Vec<u8> {
+fn select(
+    dialect: Dialect,
+    sampler: &Sampler,
+    time_filter: Option<&str>,
+    dep_conditions: Vec<Vec<u8>>,
+) -> Vec<u8> {
     let mut conditions: Vec<Vec<u8>> = Vec::new();
     if let Some(filter) = &sampler.filter {
         conditions.push(format!("({filter})").into_bytes());
@@ -298,7 +385,7 @@ fn select(sampler: &Sampler, time_filter: Option<&str>, dep_conditions: Vec<Vec<
     conditions.extend(dep_conditions);
 
     let mut sql = b"SELECT * FROM ".to_vec();
-    push_identifier(&mut sql, &sampler.table);
+    push_identifier(&mut sql, dialect, &sampler.table);
     if !conditions.is_empty() {
         sql.extend_from_slice(b" WHERE ");
         sql.extend_from_slice(&conditions.join(&b" AND "[..]));
@@ -309,9 +396,92 @@ fn select(sampler: &Sampler, time_filter: Option<&str>, dep_conditions: Vec<Vec<
     sql
 }
 
+/// What a SQL file of the sample starts with: the settings that let its INSERTs load in any
+/// order.
+#[must_use]
+pub fn file_header(dialect: Dialect) -> &'static [u8] {
+    match dialect {
+        Dialect::MySql => b"SET NAMES utf8mb4;\nSET FOREIGN_KEY_CHECKS=0;\n\n",
+        // A replica's role skips foreign key checks, which a sample's tables can't pass in the
+        // order they're written.
+        Dialect::Postgres => {
+            b"SET client_encoding = 'UTF8';\n\
+              SET standard_conforming_strings = on;\n\
+              SET session_replication_role = replica;\n\n"
+        }
+    }
+}
+
+/// What a SQL file of the sample ends with, after the INSERTs into `tables`: the settings put
+/// back and, for Postgres, the tables' sequences moved past the copied rows.
+#[must_use]
+pub fn file_footer(dialect: Dialect, tables: &[&str]) -> Vec<u8> {
+    match dialect {
+        Dialect::MySql => b"\nSET FOREIGN_KEY_CHECKS=1;\n".to_vec(),
+        Dialect::Postgres => {
+            let mut out = Vec::new();
+            if !tables.is_empty() {
+                push_sequence_reset(&mut out, tables);
+            }
+            out.extend_from_slice(b"\nRESET session_replication_role;\n");
+            out
+        }
+    }
+}
+
+/// Appends a Postgres block that moves the sequence behind each `serial` or identity column of
+/// `tables` to the column's highest value, so rows the database numbers itself don't clash
+/// with copied ones. MySQL needs none: its AUTO_INCREMENT follows the rows inserted.
+fn push_sequence_reset(out: &mut Vec<u8>, tables: &[&str]) {
+    use std::io::Write;
+
+    let mut regclasses = Vec::new();
+    for (index, table) in tables.iter().enumerate() {
+        if index > 0 {
+            regclasses.extend_from_slice(b", ");
+        }
+        let name = identifier(Dialect::Postgres, table);
+        push_literal(
+            &mut regclasses,
+            Dialect::Postgres,
+            Kind::Text,
+            name.as_bytes(),
+        );
+        regclasses.extend_from_slice(b"::regclass");
+    }
+    // The block is dollar-quoted, with a tag no table name holds, so none can end it early.
+    let mut tag = "$tapas$".to_string();
+    let mut attempt = 0;
+    while regclasses
+        .windows(tag.len())
+        .any(|window| window == tag.as_bytes())
+    {
+        attempt += 1;
+        tag = format!("$tapas{attempt}$");
+    }
+
+    out.extend_from_slice(format!("\nDO {tag}\n").as_bytes());
+    out.extend_from_slice(
+        b"DECLARE\n  serial record;\nBEGIN\n  FOR serial IN\n    \
+          SELECT attrelid::regclass::text AS tbl, attname AS col,\n           \
+          pg_get_serial_sequence(attrelid::regclass::text, attname) AS seq\n    \
+          FROM pg_attribute\n    WHERE attrelid IN (",
+    );
+    out.extend_from_slice(&regclasses);
+    // Writing to a `Vec` can't fail.
+    let _ = write!(
+        out,
+        ") AND attnum > 0 AND NOT attisdropped\n  LOOP\n    \
+         IF serial.seq IS NOT NULL THEN\n      \
+         EXECUTE format('SELECT setval(%L, max(%I)) FROM %s HAVING max(%I) IS NOT NULL',\n        \
+         serial.seq, serial.col, serial.tbl, serial.col);\n    \
+         END IF;\n  END LOOP;\nEND\n{tag};\n"
+    );
+}
+
 /// Builds one multi-row INSERT.
 #[must_use]
-pub fn insert(table: &str, columns: &[String], rows: &[Vec<Vec<u8>>]) -> Vec<u8> {
+pub fn insert(dialect: Dialect, table: &str, columns: &[String], rows: &[Vec<Vec<u8>>]) -> Vec<u8> {
     // Sized up front: a batch's statement is large, and growing it would copy it several times.
     let header_bytes: usize =
         table.len() + columns.iter().map(|name| name.len() + 4).sum::<usize>();
@@ -319,17 +489,21 @@ pub fn insert(table: &str, columns: &[String], rows: &[Vec<Vec<u8>>]) -> Vec<u8>
         .iter()
         .map(|row| row.iter().map(|literal| literal.len() + 2).sum::<usize>() + 4)
         .sum();
-    let mut out = Vec::with_capacity(header_bytes + row_bytes + 32);
+    let mut out = Vec::with_capacity(header_bytes + row_bytes + 56);
     out.extend_from_slice(b"INSERT INTO ");
-    push_identifier(&mut out, table);
+    push_identifier(&mut out, dialect, table);
     out.extend_from_slice(b" (");
     for (index, name) in columns.iter().enumerate() {
         if index > 0 {
             out.extend_from_slice(b", ");
         }
-        push_identifier(&mut out, name);
+        push_identifier(&mut out, dialect, name);
     }
-    out.extend_from_slice(b") VALUES\n");
+    out.extend_from_slice(match dialect {
+        Dialect::MySql => b") VALUES\n",
+        // Identity columns declared GENERATED ALWAYS take the copied values too.
+        Dialect::Postgres => b") OVERRIDING SYSTEM VALUE VALUES\n",
+    });
     for (index, row) in rows.iter().enumerate() {
         out.extend_from_slice(if index == 0 { b"(" } else { b",\n(" });
         out.extend_from_slice(&row.join(&b", "[..]));
@@ -371,8 +545,8 @@ mod tests {
 
     #[test]
     fn quotes_identifiers() {
-        assert_eq!(identifier("users"), "`users`");
-        assert_eq!(identifier("we`ird"), "`we``ird`");
+        assert_eq!(identifier(Dialect::MySql, "users"), "`users`");
+        assert_eq!(identifier(Dialect::MySql, "we`ird"), "`we``ird`");
     }
 
     #[test]
@@ -398,12 +572,25 @@ mod tests {
 
     #[test]
     fn writes_literals() -> Result<(), Utf8Error> {
-        assert_eq!(literal(Kind::Text, None), b"NULL");
-        assert_eq!(literal(Kind::Number, Some(b"-12.5")), b"-12.5");
-        assert_eq!(literal(Kind::Binary, Some(&[0, 0xff, 0x10])), b"X'00ff10'");
-        assert_eq!(literal(Kind::Text, Some(b"NULL")), b"'NULL'");
+        assert_eq!(literal(Dialect::MySql, Kind::Text, None), b"NULL");
         assert_eq!(
-            text(&literal(Kind::Text, Some(b"it's a\\b\n\r\0\x1a")))?,
+            literal(Dialect::MySql, Kind::Number, Some(b"-12.5")),
+            b"-12.5"
+        );
+        assert_eq!(
+            literal(Dialect::MySql, Kind::Binary, Some(&[0, 0xff, 0x10])),
+            b"X'00ff10'"
+        );
+        assert_eq!(
+            literal(Dialect::MySql, Kind::Text, Some(b"NULL")),
+            b"'NULL'"
+        );
+        assert_eq!(
+            text(&literal(
+                Dialect::MySql,
+                Kind::Text,
+                Some(b"it's a\\b\n\r\0\x1a")
+            ))?,
             r"'it\'s a\\b\n\r\0\Z'"
         );
         Ok(())
@@ -419,21 +606,35 @@ mod tests {
             write!(expected, "{byte:02x}").expect("writing to a String doesn't fail");
         }
         expected.push('\'');
-        assert_eq!(text(&literal(Kind::Binary, Some(&bytes)))?, expected);
+        assert_eq!(
+            text(&literal(Dialect::MySql, Kind::Binary, Some(&bytes)))?,
+            expected
+        );
         Ok(())
     }
 
     #[test]
     fn quotes_names_in_every_statement() -> Result<(), Utf8Error> {
         let deps = [dep("we`ird", values(&["1"]))];
-        let queries = sampler_queries(&sampler("ta`ble", None, None), None, &deps, 10);
+        let queries = sampler_queries(
+            Dialect::MySql,
+            &sampler("ta`ble", None, None),
+            None,
+            &deps,
+            10,
+        );
         assert_eq!(
             text(&queries[0])?,
             "SELECT * FROM `ta``ble` WHERE `we``ird` IN (1)"
         );
         let columns = ["we`ird".to_string()];
         assert_eq!(
-            text(&insert("ta`ble", &columns, &[vec![b"1".to_vec()]]))?,
+            text(&insert(
+                Dialect::MySql,
+                "ta`ble",
+                &columns,
+                &[vec![b"1".to_vec()]]
+            ))?,
             "INSERT INTO `ta``ble` (`we``ird`) VALUES\n(1);\n"
         );
         Ok(())
@@ -441,7 +642,13 @@ mod tests {
 
     #[test]
     fn builds_a_plain_select() -> Result<(), Utf8Error> {
-        let queries = sampler_queries(&sampler("countries", None, None), None, &[], 10);
+        let queries = sampler_queries(
+            Dialect::MySql,
+            &sampler("countries", None, None),
+            None,
+            &[],
+            10,
+        );
         assert_eq!(queries.len(), 1);
         assert_eq!(text(&queries[0])?, "SELECT * FROM `countries`");
         Ok(())
@@ -451,6 +658,7 @@ mod tests {
     fn combines_filter_deps_and_order() -> Result<(), Utf8Error> {
         let deps = [dep("country_id", Allowed::AnyValue)];
         let queries = sampler_queries(
+            Dialect::MySql,
             &sampler("users", Some("a = 1 OR b = 2"), Some("id DESC")),
             None,
             &deps,
@@ -469,7 +677,7 @@ mod tests {
         let time_filter = Some("`created_at` >= CURDATE() - INTERVAL 2 WEEK");
         let deps = [dep("user_id", values(&["1"]))];
         assert_eq!(
-            text(&sampler_queries(&orders, time_filter, &deps, 10)[0])?,
+            text(&sampler_queries(Dialect::MySql, &orders, time_filter, &deps, 10)[0])?,
             "SELECT * FROM `orders` WHERE (total > 0) AND `created_at` >= CURDATE() - INTERVAL 2 WEEK \
              AND `user_id` IN (1)"
         );
@@ -482,7 +690,13 @@ mod tests {
             dep("user_id", values(&["1", "2", "3"])),
             dep("number_id", values(&["7", "8"])),
         ];
-        let queries = sampler_queries(&sampler("phones", None, None), None, &deps, 2);
+        let queries = sampler_queries(
+            Dialect::MySql,
+            &sampler("phones", None, None),
+            None,
+            &deps,
+            2,
+        );
         let queries: Vec<&str> = queries
             .iter()
             .map(|query| text(query))
@@ -501,7 +715,13 @@ mod tests {
     #[test]
     fn skips_samplers_whose_parents_extracted_nothing() {
         let deps = [dep("user_id", values(&[]))];
-        let queries = sampler_queries(&sampler("phones", None, None), None, &deps, 10);
+        let queries = sampler_queries(
+            Dialect::MySql,
+            &sampler("phones", None, None),
+            None,
+            &deps,
+            10,
+        );
         assert!(
             queries.is_empty(),
             "a parent with no values allows no rows, yet got {} queries",
@@ -522,20 +742,25 @@ mod tests {
         for kind in [Kind::Text, Kind::Binary] {
             for value in values {
                 let mut raw = b"kept".to_vec();
-                push_raw(&mut raw, kind, &literal(kind, Some(value)));
+                push_raw(
+                    &mut raw,
+                    Dialect::MySql,
+                    kind,
+                    &literal(Dialect::MySql, kind, Some(value)),
+                );
                 assert_eq!(&raw[4..], value, "{kind:?} {value:?}");
                 assert_eq!(&raw[..4], b"kept", "push_raw appends");
             }
         }
         let mut raw = Vec::new();
-        push_raw(&mut raw, Kind::Number, b"-12.5");
+        push_raw(&mut raw, Dialect::MySql, Kind::Number, b"-12.5");
         assert_eq!(raw, b"-12.5");
     }
 
     #[test]
     fn asks_for_the_columns_of_tables() -> Result<(), Utf8Error> {
         assert_eq!(
-            text(&columns_query(&["users", "it's"]))?,
+            text(&columns_query(Dialect::MySql, &["users", "it's"]))?,
             "SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH \
              FROM information_schema.COLUMNS \
              WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ('users', 'it\\'s') \
@@ -552,8 +777,161 @@ mod tests {
         ];
         let columns = ["id".to_string(), "name".to_string()];
         assert_eq!(
-            text(&insert("users", &columns, &rows))?,
+            text(&insert(Dialect::MySql, "users", &columns, &rows))?,
             "INSERT INTO `users` (`id`, `name`) VALUES\n(1, 'a'),\n(2, NULL);\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn picks_dialects_from_urls() {
+        assert_eq!(
+            Dialect::from_url("mysql://root@db/shop"),
+            Some(Dialect::MySql)
+        );
+        assert_eq!(
+            Dialect::from_url("postgres://db/shop"),
+            Some(Dialect::Postgres)
+        );
+        assert_eq!(
+            Dialect::from_url("postgresql://db/shop"),
+            Some(Dialect::Postgres)
+        );
+        assert_eq!(Dialect::from_url("sqlite://shop.db"), None);
+        assert_eq!(Dialect::from_url("db/shop"), None);
+    }
+
+    #[test]
+    fn quotes_postgres_identifiers() {
+        assert_eq!(identifier(Dialect::Postgres, "users"), r#""users""#);
+        assert_eq!(identifier(Dialect::Postgres, r#"we"ird"#), r#""we""ird""#);
+        assert_eq!(identifier(Dialect::Postgres, "we`ird"), r#""we`ird""#);
+    }
+
+    #[test]
+    fn writes_postgres_literals() -> Result<(), Utf8Error> {
+        let postgres = Dialect::Postgres;
+        assert_eq!(literal(postgres, Kind::Text, None), b"NULL");
+        assert_eq!(literal(postgres, Kind::Number, Some(b"-12.5")), b"-12.5");
+        assert_eq!(
+            literal(postgres, Kind::Binary, Some(&[0, 0xff, 0x10])),
+            br"'\x00ff10'"
+        );
+        // Backslashes are plain characters with standard_conforming_strings, which tapas sets.
+        assert_eq!(
+            text(&literal(postgres, Kind::Text, Some(b"it's a\\b\n'")))?,
+            "'it''s a\\b\n'''"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reads_postgres_literals_back() {
+        let values: [&[u8]; 5] = [b"", b"plain", b"it's a\\b\n", b"''", "ção".as_bytes()];
+        for kind in [Kind::Text, Kind::Binary] {
+            for value in values {
+                let mut raw = b"kept".to_vec();
+                let literal = literal(Dialect::Postgres, kind, Some(value));
+                push_raw(&mut raw, Dialect::Postgres, kind, &literal);
+                assert_eq!(&raw[4..], value, "{kind:?} {value:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn builds_postgres_selects() -> Result<(), Utf8Error> {
+        let deps = [
+            dep("user_id", values(&["'1'", "'2'"])),
+            dep("country_id", Allowed::AnyValue),
+        ];
+        let queries = sampler_queries(
+            Dialect::Postgres,
+            &sampler("Phones", Some("a = 1"), Some("id")),
+            Some(r#""created_at" >= CURRENT_DATE - INTERVAL '2 WEEK'"#),
+            &deps,
+            10,
+        );
+        assert_eq!(
+            text(&queries[0])?,
+            "SELECT * FROM \"Phones\" WHERE (a = 1) \
+             AND \"created_at\" >= CURRENT_DATE - INTERVAL '2 WEEK' \
+             AND \"user_id\" IN ('1', '2') AND \"country_id\" IS NOT NULL ORDER BY id"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn builds_postgres_inserts_that_set_identity_columns() -> Result<(), Utf8Error> {
+        let rows = vec![
+            vec![b"'1'".to_vec(), b"'a'".to_vec()],
+            vec![b"'2'".to_vec(), b"NULL".to_vec()],
+        ];
+        let columns = ["id".to_string(), "Name".to_string()];
+        assert_eq!(
+            text(&insert(Dialect::Postgres, "users", &columns, &rows))?,
+            "INSERT INTO \"users\" (\"id\", \"Name\") OVERRIDING SYSTEM VALUE VALUES\n\
+             ('1', 'a'),\n('2', NULL);\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn asks_postgres_for_the_columns_of_tables() -> Result<(), Utf8Error> {
+        assert_eq!(
+            text(&columns_query(Dialect::Postgres, &["users", "it's"]))?,
+            "SELECT table_name, column_name, data_type, character_maximum_length \
+             FROM information_schema.columns \
+             WHERE table_schema = current_schema() AND table_name IN ('users', 'it''s') \
+             ORDER BY table_name, ordinal_position"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn frames_mysql_files() -> Result<(), Utf8Error> {
+        assert_eq!(
+            text(file_header(Dialect::MySql))?,
+            "SET NAMES utf8mb4;\nSET FOREIGN_KEY_CHECKS=0;\n\n"
+        );
+        assert_eq!(
+            text(&file_footer(Dialect::MySql, &["users"]))?,
+            "\nSET FOREIGN_KEY_CHECKS=1;\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn frames_postgres_files() -> Result<(), Utf8Error> {
+        assert_eq!(
+            text(file_header(Dialect::Postgres))?,
+            "SET client_encoding = 'UTF8';\n\
+             SET standard_conforming_strings = on;\n\
+             SET session_replication_role = replica;\n\n"
+        );
+        assert_eq!(
+            text(&file_footer(Dialect::Postgres, &[]))?,
+            "\nRESET session_replication_role;\n"
+        );
+        let footer = file_footer(Dialect::Postgres, &["users", "it's"]);
+        let footer = text(&footer)?;
+        assert!(
+            footer.contains(r#"attrelid IN ('"users"'::regclass, '"it''s"'::regclass)"#),
+            "the footer moves the sequences of the sample's tables only: {footer}"
+        );
+        assert!(
+            footer.contains("setval(") && footer.ends_with("\nRESET session_replication_role;\n"),
+            "{footer}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn postgres_footers_quote_the_block_with_a_tag_no_table_uses() -> Result<(), Utf8Error> {
+        let footer = file_footer(Dialect::Postgres, &["a$tapas$b"]);
+        let footer = text(&footer)?;
+        assert!(
+            footer.starts_with("\nDO $tapas1$") && footer.contains("\n$tapas1$;\n"),
+            "{footer}"
         );
         Ok(())
     }
