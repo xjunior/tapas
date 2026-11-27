@@ -13,8 +13,7 @@ What tapas doesn't do yet, or does in a way worth knowing about.
 
 ## Output
 
-- **SQL files only.** tapas can't write straight into a database yet.
-- **No schema.** The target needs every table already.
+- **No schema.** The target, file or database, needs every table already.
 - **MySQL only,** for both reading and the SQL it writes.
 
 ## Configuration

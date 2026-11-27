@@ -118,7 +118,7 @@ async fn extracts_a_sample_that_keeps_references() {
         plan,
         &format!("{base}/tapas_source"),
         4,
-        &output,
+        &tapas::Output::File(output.clone()),
         // Small chunks and batches so chunking and batching are exercised.
         tapas::Options {
             chunk_size: 7,

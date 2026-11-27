@@ -5,6 +5,11 @@ and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`--target`**, to write the sample straight into another database instead of a file, in one transaction that's
+  only committed once the whole sample worked. `TAPAS_TARGET_URL` works too.
+
 ## [0.1.0] - 2026-11-27
 
 The first version: a sample of a MySQL database, written to a SQL file, with every reference intact.
