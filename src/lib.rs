@@ -9,6 +9,7 @@ pub mod plan;
 mod run;
 pub mod sanitize;
 pub mod since;
+pub mod source;
 pub mod sql;
 
 pub use config::Config;

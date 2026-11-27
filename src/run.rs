@@ -3,13 +3,13 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Result, bail};
-use mysql_async::{Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts};
+use mysql_async::Opts;
 
 use crate::extract::{self, Options};
 use crate::output::{Outcome, Output, Sink};
 use crate::plan::Plan;
-use crate::sanitize::{ColumnInfo, Sanitizer, Seed};
-use crate::sql;
+use crate::sanitize::{Sanitizer, Seed};
+use crate::source::Source;
 
 /// Extracts the sample `plan` describes from `source_url` into `output`, a SQL file or a target
 /// database. Returns the number of rows written per table.
@@ -24,8 +24,6 @@ pub async fn run(
     output: &Output,
     options: Options,
 ) -> Result<BTreeMap<String, u64>> {
-    use anyhow::Context;
-
     plan.check_since()?;
     if let Output::Database(target_url) = output
         && same_database(source_url, target_url)
@@ -33,31 +31,25 @@ pub async fn run(
         bail!("the target is the source database; tapas won't write into what it reads");
     }
 
-    let connection_options = Opts::from_url(source_url).context("parsing the source URL")?;
-    let constraints = PoolConstraints::new(1, connections.max(1)).context("pool size")?;
-    let connection_options = OptsBuilder::from_opts(connection_options)
-        .pool_opts(PoolOpts::default().with_constraints(constraints))
-        // tapas only reads; make sure of it.
-        .setup(vec!["SET SESSION TRANSACTION READ ONLY"]);
-    let pool = Pool::new(connection_options);
+    let source = Source::try_new(source_url, connections)?;
 
     // Checked before the output opens, so a bad rule leaves nothing behind.
-    let sanitizer = match sanitizer(&plan, &pool, options.sanitize_seed).await {
+    let sanitizer = match sanitizer(&plan, &source, options.sanitize_seed).await {
         Ok(sanitizer) => sanitizer,
         Err(error) => {
-            pool.disconnect().await.ok();
+            source.disconnect().await;
             return Err(error);
         }
     };
     let (sink, sender) = Sink::open(output).await?;
-    let extracted = extract::extract(plan, pool.clone(), options, sanitizer, sender).await;
+    let extracted = extract::extract(plan, source.clone(), options, sanitizer, sender).await;
     let outcome = if extracted.is_ok() {
         Outcome::Keep
     } else {
         Outcome::Discard
     };
     let written = sink.finish(outcome).await;
-    pool.disconnect().await.ok();
+    source.disconnect().await;
 
     let rows = extracted?;
     written?;
@@ -66,10 +58,7 @@ pub async fn run(
 
 /// Works out what the plan's sanitize rules do to each table, from the source's columns. Reads
 /// them in one query, and only when there are rules.
-async fn sanitizer(plan: &Plan, pool: &Pool, seed: Option<Seed>) -> Result<Sanitizer> {
-    use anyhow::Context;
-    use mysql_async::prelude::Queryable;
-
+async fn sanitizer(plan: &Plan, source: &Source, seed: Option<Seed>) -> Result<Sanitizer> {
     if plan.sanitize.is_empty() {
         return Ok(Sanitizer::default());
     }
@@ -78,19 +67,7 @@ async fn sanitizer(plan: &Plan, pool: &Pool, seed: Option<Seed>) -> Result<Sanit
     } else {
         plan.tables.keys().map(String::as_str).collect()
     };
-    let query = sql::columns_query(&tables);
-    let mut connection = pool.get_conn().await?;
-    let rows: Vec<(String, String, String, Option<u64>)> = connection
-        .query(query.as_slice())
-        .await
-        .context("reading the source's columns")?;
-    let mut columns: BTreeMap<String, Vec<ColumnInfo>> = BTreeMap::new();
-    for (table, name, data_type, max_chars) in rows {
-        columns
-            .entry(table)
-            .or_default()
-            .push(ColumnInfo::new(name, &data_type, max_chars));
-    }
+    let columns = source.columns(&tables).await?;
     Sanitizer::try_new(plan, &columns, seed.unwrap_or_else(Seed::random))
 }
 
