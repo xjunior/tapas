@@ -47,6 +47,18 @@ impl KeySet {
             self.order.push(value.to_vec());
         }
     }
+
+    /// Returns how many distinct values were found so far.
+    #[must_use]
+    fn found(&self) -> usize {
+        self.order.len()
+    }
+
+    /// Returns the values found after the first `from`, in the order they were found.
+    #[must_use]
+    fn values_from(&self, from: usize) -> Vec<Vec<u8>> {
+        self.order[from..].to_vec()
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -343,17 +355,17 @@ fn current_deps(
                 Some(named) => lock(named),
                 None => lock(&context.tables[&parent.table]),
             };
-            let values = &state.keys[&parent.column].order;
+            let keys = &state.keys[&parent.column];
             let from = match cursors.as_deref_mut() {
                 Some(cursors) if cycle_deps == [column.as_str()] => {
                     let cursor = cursors.entry(index).or_insert(0);
-                    mem::replace(cursor, values.len())
+                    mem::replace(cursor, keys.found())
                 }
                 _ => 0,
             };
             Dep {
                 column,
-                allowed: Allowed::Values(values[from..].to_vec()),
+                allowed: Allowed::Values(keys.values_from(from)),
             }
         })
         .collect()
@@ -584,6 +596,18 @@ mod tests {
 
     fn row(values: &[&[u8]]) -> Vec<Vec<u8>> {
         values.iter().map(|value| value.to_vec()).collect()
+    }
+
+    #[test]
+    fn key_sets_keep_each_value_once_in_the_order_found() {
+        let mut keys = KeySet::default();
+        for value in [b"3", b"1", b"3", b"2", b"1"] {
+            keys.insert(value);
+        }
+        assert_eq!(keys.found(), 3);
+        assert_eq!(keys.values_from(0), row(&[b"3", b"1", b"2"]));
+        assert_eq!(keys.values_from(1), row(&[b"1", b"2"]));
+        assert_eq!(keys.values_from(3), row(&[]));
     }
 
     #[test]
