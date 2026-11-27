@@ -6,6 +6,7 @@ rust-version = "1.88"
 description = "Pulls a sample out of a MySQL database into a SQL file, keeping every reference intact"
 readme = "README.md"
 license = "MIT"
+repository = "https://github.com/xjunior/tapas"
 keywords = ["mysql", "sampling", "test-data", "database", "cli"]
 categories = ["command-line-utilities", "database"]
 publish = false

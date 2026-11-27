@@ -3,9 +3,9 @@
 Every notable change to tapas lands here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## [Unreleased]
 
-## 0.1.0 - 2026-11-27
+## [0.1.0] - 2026-11-27
 
 The first version: a sample of a MySQL database, written to a SQL file, with every reference intact.
 
@@ -28,3 +28,5 @@ The first version: a sample of a MySQL database, written to a SQL file, with eve
 - **Clear errors.** Unknown keys, missing parents, name clashes and conflicting `deps` are caught before anything runs,
   and every error names the file and sampler it came from.
 
+[Unreleased]: https://github.com/xjunior/tapas/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/xjunior/tapas/releases/tag/v0.1.0
