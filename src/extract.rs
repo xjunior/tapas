@@ -1,24 +1,21 @@
 //! Runs a plan's samplers against the source and streams their rows out as INSERT statements.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::mem;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
-use std::{mem, pin};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use indexmap::IndexSet;
-use mysql_async::{Pool, Row, Value};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
-use tokio_postgres::SimpleQueryMessage;
 use xxhash_rust::xxh3;
 
 use crate::config::Columns;
 use crate::plan::Plan;
-use crate::postgres;
 use crate::sanitize::{Placed, Sanitizer, Scratch, Seed};
-use crate::source::Source;
-use crate::sql::{self, Allowed, Dep, Dialect, Kind};
+use crate::source::{RowSink, Source};
+use crate::sql::{self, Allowed, Dep, Kind};
 
 /// How the extraction runs: how it splits its queries and statements, and where fake values
 /// start from.
@@ -447,9 +444,17 @@ async fn run_query(
     limit: Option<u64>,
 ) -> Result<u64> {
     push_limit(&mut query, limit);
-    let ran = match &context.source {
-        Source::MySql(pool) => run_mysql_query(context, index, pool, &query).await,
-        Source::Postgres(pool) => run_postgres_query(context, index, pool, &query).await,
+    let table = context.plan.samplers[index].table.as_str();
+    let batcher = context
+        .source
+        .query(table, &query, |names, kinds| {
+            Batcher::try_new(context, index, names, kinds)
+        })
+        .await;
+    let ran = match batcher {
+        Ok(Some(batcher)) => batcher.finish().await,
+        Ok(None) => Ok(0),
+        Err(error) => Err(error),
     };
     ran.with_context(|| format!("running {}", shown_query(context, index, &query, limit)))
 }
@@ -471,107 +476,11 @@ fn push_limit(query: &mut Vec<u8>, limit: Option<u64>) {
     }
 }
 
-async fn run_mysql_query(context: &Shared, index: usize, pool: &Pool, query: &[u8]) -> Result<u64> {
-    use futures_util::StreamExt;
-    use mysql_async::prelude::Queryable;
-
-    let mut connection = pool.get_conn().await?;
-    let mut result = connection.query_iter(query).await?;
-    let Some(mut stream) = result.stream::<Row>().await? else {
-        return Ok(0);
-    };
-
-    let columns = stream.columns();
-    let names: Vec<String> = columns
-        .iter()
-        .map(|column| column.name_str().into_owned())
-        .collect();
-    let kinds: Vec<Kind> = columns
-        .iter()
-        .map(|column| Kind::new(column.column_type(), column.character_set()))
-        .collect();
-    let mut batcher = Batcher::try_new(context, index, &names, &kinds)?;
-
-    while let Some(row) = stream.next().await {
-        let row = row?;
-        let mut literals = Vec::with_capacity(kinds.len());
-        for (index, kind) in kinds.iter().enumerate() {
-            let value = match row.as_ref(index) {
-                Some(Value::NULL) | None => None,
-                Some(Value::Bytes(bytes)) => Some(bytes.as_slice()),
-                Some(
-                    other @ (Value::Int(_)
-                    | Value::UInt(_)
-                    | Value::Float(_)
-                    | Value::Double(_)
-                    | Value::Date(..)
-                    | Value::Time(..)),
-                ) => bail!(
-                    "unexpected value {other:?} in {}.{}",
-                    batcher.table,
-                    names[index]
-                ),
-            };
-            literals.push(sql::literal(Dialect::MySql, *kind, value));
-        }
-        batcher.push(literals).await?;
-    }
-    batcher.finish().await
-}
-
-/// Runs a query on Postgres with the simple query protocol, which sends every value as text that
-/// reads back as the same value, whatever its type. So every value is written as a quoted literal,
-/// and Postgres turns it back into the column's type.
-async fn run_postgres_query(
-    context: &Shared,
-    index: usize,
-    pool: &postgres::Pool,
-    query: &[u8],
-) -> Result<u64> {
-    use futures_util::StreamExt;
-
-    // Built from the config and from values Postgres sent as text, so always UTF-8.
-    let query = str::from_utf8(query)?;
-    let connection = pool.get().await?;
-    let messages = connection.simple_query_raw(query).await?;
-    let mut messages = pin::pin!(messages);
-
-    let columns = loop {
-        match messages.next().await {
-            Some(message) => {
-                if let SimpleQueryMessage::RowDescription(columns) = message? {
-                    break columns;
-                }
-            }
-            None => return Ok(0),
-        }
-    };
-    let names: Vec<String> = columns
-        .iter()
-        .map(|column| column.name().to_string())
-        .collect();
-    let kinds = vec![Kind::Text; names.len()];
-    let mut batcher = Batcher::try_new(context, index, &names, &kinds)?;
-
-    while let Some(message) = messages.next().await {
-        let SimpleQueryMessage::Row(row) = message? else {
-            continue;
-        };
-        let mut literals = Vec::with_capacity(names.len());
-        for column in 0..names.len() {
-            let value = row.try_get(column)?.map(str::as_bytes);
-            literals.push(sql::literal(Dialect::Postgres, Kind::Text, value));
-        }
-        batcher.push(literals).await?;
-    }
-    batcher.finish().await
-}
-
 /// Gathers one query's rows, as literals, into batches, and writes each batch out once it's full.
 struct Batcher<'query> {
     context: &'query Shared,
     table: &'query str,
-    names: &'query [String],
+    names: Vec<String>,
     keep: Keep<'query>,
     sanitize: Placed<'query>,
     batch: Vec<Vec<Vec<u8>>>,
@@ -585,7 +494,7 @@ impl<'query> Batcher<'query> {
     fn try_new(
         context: &'query Shared,
         index: usize,
-        names: &'query [String],
+        names: &[String],
         kinds: &[Kind],
     ) -> Result<Self> {
         let sampler = &context.plan.samplers[index];
@@ -607,7 +516,7 @@ impl<'query> Batcher<'query> {
         Ok(Self {
             context,
             table,
-            names,
+            names: names.to_vec(),
             keep,
             sanitize,
             batch: Vec::with_capacity(context.options.batch_rows),
@@ -616,7 +525,7 @@ impl<'query> Batcher<'query> {
     }
 
     /// Adds a row of literals, and writes the batch out once it's full.
-    async fn push(&mut self, row: Vec<Vec<u8>>) -> Result<()> {
+    async fn push_row(&mut self, row: Vec<Vec<u8>>) -> Result<()> {
         self.batch.push(row);
         self.returned += 1;
         if self.batch.len() >= self.context.options.batch_rows {
@@ -638,12 +547,18 @@ impl<'query> Batcher<'query> {
         write_batch(
             self.context,
             self.table,
-            self.names,
+            &self.names,
             &self.keep,
             &self.sanitize,
             batch,
         )
         .await
+    }
+}
+
+impl RowSink for Batcher<'_> {
+    async fn push(&mut self, row: Vec<Vec<u8>>) -> Result<()> {
+        self.push_row(row).await
     }
 }
 

@@ -482,11 +482,7 @@ fn write_replacement(
             if column.max_chars.is_some() {
                 value.extend_from_slice(b"LEFT(");
             }
-            let (open, separator, close): (&[u8], &[u8], &[u8]) = match dialect {
-                Dialect::MySql => (b"CONCAT(", b", ", b")"),
-                // Postgres's CONCAT skips NULLs; `||` turns them into NULL, as MySQL's CONCAT does.
-                Dialect::Postgres => (b"CAST(", b" || ", b" AS text)"),
-            };
+            let (open, separator, close) = dialect.concat();
             value.extend_from_slice(open);
             for (index, piece) in pieces.iter().enumerate() {
                 if index > 0 {

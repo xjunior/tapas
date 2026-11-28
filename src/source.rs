@@ -2,15 +2,17 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{Context, Result};
-use mysql_async::{Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts};
+use std::pin;
+
+use anyhow::{Context, Result, bail};
+use mysql_async::{Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts, Row, Value};
 use tokio_postgres::SimpleQueryMessage;
 
 use crate::config::{ColumnRef, Columns};
 use crate::plan::ForeignKey;
 use crate::postgres;
 use crate::sanitize::ColumnInfo;
-use crate::sql::{self, Dialect};
+use crate::sql::{self, Dialect, Kind};
 
 /// Session settings for every Postgres source connection: it only reads, and writes values as
 /// text that reads back exactly the same: ISO dates, floats with every digit, and backslashes as
@@ -19,6 +21,12 @@ const POSTGRES_SETTINGS: &str = "-c default_transaction_read_only=on \
                                  -c standard_conforming_strings=on \
                                  -c DateStyle=ISO -c IntervalStyle=postgres \
                                  -c extra_float_digits=1";
+
+/// Takes the rows of one query, as SQL literals, in the order the source sends them.
+pub trait RowSink {
+    /// Adds a row, with one literal per column.
+    fn push(&mut self, row: Vec<Vec<u8>>) -> impl Future<Output = Result<()>> + Send;
+}
 
 /// The source database, with at most a set number of connections open at once. Clones share
 /// the connections.
@@ -54,6 +62,22 @@ impl Source {
                 config.options(settings);
                 Ok(Source::Postgres(postgres::Pool::new(config, connections)))
             }
+        }
+    }
+
+    /// Runs `query` on the source, which reads rows of `table`, and feeds its rows to a sink.
+    /// `start` makes the sink from the result's column names and the kinds of their values, once
+    /// the source has sent them. Returns the sink, or nothing if the query returned no result
+    /// set.
+    pub async fn query<S: RowSink>(
+        &self,
+        table: &str,
+        query: &[u8],
+        start: impl FnOnce(&[String], &[Kind]) -> Result<S>,
+    ) -> Result<Option<S>> {
+        match self {
+            Source::MySql(pool) => mysql_rows(pool, table, query, start).await,
+            Source::Postgres(pool) => postgres_rows(pool, query, start).await,
         }
     }
 
@@ -194,6 +218,102 @@ fn group_foreign_keys(rows: Vec<(String, String, String, String, String)>) -> Ve
             key
         })
         .collect()
+}
+
+async fn mysql_rows<S: RowSink>(
+    pool: &Pool,
+    table: &str,
+    query: &[u8],
+    start: impl FnOnce(&[String], &[Kind]) -> Result<S>,
+) -> Result<Option<S>> {
+    use futures_util::StreamExt;
+    use mysql_async::prelude::Queryable;
+
+    let mut connection = pool.get_conn().await?;
+    let mut result = connection.query_iter(query).await?;
+    let Some(mut stream) = result.stream::<Row>().await? else {
+        return Ok(None);
+    };
+
+    let columns = stream.columns();
+    let names: Vec<String> = columns
+        .iter()
+        .map(|column| column.name_str().into_owned())
+        .collect();
+    let kinds: Vec<Kind> = columns
+        .iter()
+        .map(|column| sql::mysql::column_kind(column.column_type(), column.character_set()))
+        .collect();
+    let mut sink = start(&names, &kinds)?;
+
+    while let Some(row) = stream.next().await {
+        let row = row?;
+        let mut literals = Vec::with_capacity(kinds.len());
+        for (index, kind) in kinds.iter().enumerate() {
+            let value = match row.as_ref(index) {
+                Some(Value::NULL) | None => None,
+                Some(Value::Bytes(bytes)) => Some(bytes.as_slice()),
+                Some(
+                    other @ (Value::Int(_)
+                    | Value::UInt(_)
+                    | Value::Float(_)
+                    | Value::Double(_)
+                    | Value::Date(..)
+                    | Value::Time(..)),
+                ) => bail!("unexpected value {other:?} in {table}.{}", names[index]),
+            };
+            literals.push(sql::literal(Dialect::MySql, *kind, value));
+        }
+        sink.push(literals).await?;
+    }
+    Ok(Some(sink))
+}
+
+/// Runs a query on Postgres with the simple query protocol, which sends every value as text that
+/// reads back as the same value, whatever its type. So every value is written as a quoted literal,
+/// and Postgres turns it back into the column's type.
+async fn postgres_rows<S: RowSink>(
+    pool: &postgres::Pool,
+    query: &[u8],
+    start: impl FnOnce(&[String], &[Kind]) -> Result<S>,
+) -> Result<Option<S>> {
+    use futures_util::StreamExt;
+
+    // Built from the config and from values Postgres sent as text, so always UTF-8.
+    let query = str::from_utf8(query)?;
+    let connection = pool.get().await?;
+    let messages = connection.simple_query_raw(query).await?;
+    let mut messages = pin::pin!(messages);
+
+    let columns = loop {
+        match messages.next().await {
+            Some(message) => {
+                if let SimpleQueryMessage::RowDescription(columns) = message? {
+                    break columns;
+                }
+            }
+            None => return Ok(None),
+        }
+    };
+    let names: Vec<String> = columns
+        .iter()
+        .map(|column| column.name().to_string())
+        .collect();
+    let kinds = vec![Kind::Text; names.len()];
+    let mut sink = start(&names, &kinds)?;
+
+    while let Some(message) = messages.next().await {
+        let SimpleQueryMessage::Row(row) = message? else {
+            continue;
+        };
+        let mut literals = Vec::with_capacity(names.len());
+        for column in 0..names.len() {
+            let value = row.try_get(column)?.map(str::as_bytes);
+            literals.push(sql::literal(Dialect::Postgres, Kind::Text, value));
+        }
+        sink.push(literals).await?;
+    }
+    Ok(Some(sink))
 }
 
 #[cfg(test)]
