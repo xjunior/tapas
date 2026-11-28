@@ -67,10 +67,22 @@ struct Args {
     #[arg(long, env = "TAPAS_SANITIZE_SEED", hide_env_values = true)]
     sanitize_seed: Option<Seed>,
 
+    /// Follow only the `deps` and `of` the config declares, not the source's foreign keys.
+    /// Overrides `foreign_keys: true` in the config.
+    #[arg(long)]
+    disable_foreign_keys: bool,
+
     /// Show the values in errors, such as every row of an INSERT the target refused. Those rows
     /// are as tapas writes them, so sanitized columns hold their replacements.
     #[arg(long)]
     debug: bool,
+}
+
+/// Returns whether to follow the source's foreign keys: always, unless the command line or the
+/// config turns it off.
+#[must_use]
+fn follows_foreign_keys(disabled: bool, config: Option<bool>) -> bool {
+    !disabled && config.unwrap_or(true)
 }
 
 #[tokio::main]
@@ -78,13 +90,26 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let started = Instant::now();
 
-    let plan = Plan::try_new(Config::load(&args.configs)?, args.since)?;
+    let config = Config::load(&args.configs)?;
+    let mut foreign_keys = Vec::new();
+    let mut unread = false;
+    if follows_foreign_keys(args.disable_foreign_keys, config.foreign_keys) {
+        match args.source.as_deref() {
+            Some(source) => foreign_keys = tapas::foreign_keys(source).await?,
+            // Only --plan runs without a source.
+            None => unread = true,
+        }
+    }
+    let plan = Plan::try_new_with_foreign_keys(config, args.since, &foreign_keys)?;
     if args.plan {
         let dialect = match args.source.as_deref() {
             Some(url) => Dialect::from_url(url)
                 .context("--source must start with mysql:// or postgres://")?,
             None => Dialect::MySql,
         };
+        if unread {
+            println!("foreign keys: not read, since --source wasn't given");
+        }
         print!("{}", plan.describe(dialect));
         return Ok(());
     }
@@ -120,6 +145,34 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn foreign_keys_are_followed_unless_disabled() -> Result<()> {
+        let args = Args::try_parse_from(["tapas", "tapas.yml", "--plan"])?;
+        assert!(!args.disable_foreign_keys, "foreign keys are on by default");
+        let args =
+            Args::try_parse_from(["tapas", "tapas.yml", "--plan", "--disable-foreign-keys"])?;
+        assert!(args.disable_foreign_keys);
+        Ok(())
+    }
+
+    #[test]
+    fn the_command_line_and_the_config_can_each_turn_foreign_keys_off() {
+        assert!(follows_foreign_keys(false, None), "on by default");
+        assert!(follows_foreign_keys(false, Some(true)));
+        assert!(
+            !follows_foreign_keys(false, Some(false)),
+            "the config turns it off"
+        );
+        assert!(
+            !follows_foreign_keys(true, None),
+            "the command line turns it off"
+        );
+        assert!(
+            !follows_foreign_keys(true, Some(true)),
+            "the command line wins over the config"
+        );
+    }
 
     #[test]
     fn debug_is_off_unless_asked_for() -> Result<()> {

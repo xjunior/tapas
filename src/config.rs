@@ -22,6 +22,8 @@ pub struct Config {
     pub samplers: Vec<Sampler>,
     /// What to write in place of sensitive values.
     pub sanitize: Sanitize,
+    /// Whether to follow the source's foreign keys, when a file says. Without one, tapas does.
+    pub foreign_keys: Option<bool>,
 }
 
 /// What one file holds. A file can hold only samplers, only `sanitize:`, or both.
@@ -32,6 +34,7 @@ struct File {
     samplers: Vec<Sampler>,
     #[serde(default)]
     sanitize: SanitizeFile,
+    foreign_keys: Option<bool>,
 }
 
 /// The `sanitize:` section of one file.
@@ -726,6 +729,8 @@ impl Config {
     /// one file; a file named twice is loaded once.
     pub fn load(patterns: &[String]) -> Result<Self> {
         let mut merged = Self::default();
+        // The file that set `foreign_keys` first, so a file that disagrees can name it.
+        let mut foreign_keys_file: Option<String> = None;
         for path in expand(patterns)? {
             let text =
                 fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
@@ -733,6 +738,19 @@ impl Config {
                 .with_context(|| format!("parsing {}", path.display()))?;
             merged.samplers.extend(config.samplers);
             merged.sanitize.merge(config.sanitize)?;
+            if let Some(follow) = config.foreign_keys {
+                match (merged.foreign_keys, &foreign_keys_file) {
+                    (Some(seen), Some(file)) if seen != follow => bail!(
+                        "foreign_keys is {seen} in {file} and {follow} in {}",
+                        path.display()
+                    ),
+                    (Some(_), Some(_)) => {}
+                    (_, _) => {
+                        merged.foreign_keys = Some(follow);
+                        foreign_keys_file = Some(path.display().to_string());
+                    }
+                }
+            }
         }
         if merged.samplers.is_empty() {
             bail!("no samplers defined");
@@ -762,7 +780,11 @@ impl Config {
                 .map(|(table, rules)| (table, rules.into_rules(name)))
                 .collect(),
         };
-        Ok(Self { samplers, sanitize })
+        Ok(Self {
+            samplers,
+            sanitize,
+            foreign_keys: file.foreign_keys,
+        })
     }
 }
 
@@ -1116,6 +1138,56 @@ samplers:
 "#
         .parse()?;
         assert_eq!(config.samplers[0].deps.len(), 2, "both keys use tenant_id");
+        Ok(())
+    }
+
+    #[test]
+    fn a_file_says_whether_to_follow_foreign_keys() -> Result<()> {
+        let config: Config = "samplers:\n  - table: users\n    limit: all\n".parse()?;
+        assert_eq!(
+            config.foreign_keys, None,
+            "a config that doesn't say leaves it open"
+        );
+
+        let config: Config =
+            "foreign_keys: false\nsamplers:\n  - table: users\n    limit: all\n".parse()?;
+        assert_eq!(config.foreign_keys, Some(false));
+        let config: Config =
+            "foreign_keys: true\nsamplers:\n  - table: users\n    limit: all\n".parse()?;
+        assert_eq!(config.foreign_keys, Some(true));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_foreign_keys_that_are_not_true_or_false() {
+        let error = "foreign_keys: sometimes\nsamplers:\n  - table: users\n    limit: all\n"
+            .parse::<Config>()
+            .expect_err("`sometimes` isn't a boolean");
+        assert!(error.to_string().contains("expected a boolean"), "{error}");
+    }
+
+    #[test]
+    fn files_must_agree_on_whether_to_follow_foreign_keys() -> Result<()> {
+        let dir = TempDir::new("foreign-keys")?;
+        let samplers = "samplers:\n  - table: users\n    limit: all\n";
+        let off = dir.write("off.yml", &format!("foreign_keys: false\n{samplers}"))?;
+        let again = dir.write("again.yml", &format!("foreign_keys: false\n{samplers}"))?;
+        let silent = dir.write("silent.yml", samplers)?;
+        let on = dir.write("on.yml", &format!("foreign_keys: true\n{samplers}"))?;
+
+        let config = Config::load(&[off.clone(), silent.clone(), again])?;
+        assert_eq!(
+            config.foreign_keys,
+            Some(false),
+            "a file that doesn't say takes nothing back"
+        );
+
+        let error =
+            Config::load(&[off.clone(), silent, on.clone()]).expect_err("two files disagree");
+        assert_eq!(
+            error.to_string(),
+            format!("foreign_keys is false in {off} and true in {on}")
+        );
         Ok(())
     }
 

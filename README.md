@@ -8,8 +8,8 @@ what to take in YAML; tapas works out the order, runs everything it can in paral
 one that was left behind.
 
 - **Samplers.** Pick rows per table with plain SQL, a time window, a limit, or by following other tables.
-- **References that hold.** `deps` brings along every row your rows point at. `of` takes the rows that belong to what's
-  already in the sample.
+- **References that hold.** `deps` brings along every row your rows point at, and tapas follows the foreign keys on
+  its own. `of` takes the rows that belong to what's already in the sample.
 - **One config, many sizes.** `--since '2 weeks'` for a laptop, `--since '3 months'` for a review environment.
 - **No personal data.** Replace emails, names, SSNs and more with fakes that look real. The same email gets the same
   fake everywhere it appears, so data that matched still matches.
@@ -82,13 +82,17 @@ tapas tapas.yml --since '2 weeks' --source postgres://user:password@host:5432/sh
 psql shop_dev -f sample.sql
 ```
 
+tapas also follows the source's foreign keys, so you only write the `deps` the schema doesn't state. To follow just
+the ones you write, add `foreign_keys: false` to the config or pass `--disable-foreign-keys`.
+
 Either way tapas writes `INSERT` statements only, so the target needs the schema already. Passwords can stay off the
 command line too: see [Command line](docs/cli.md#connection-urls). There's a fuller example in
 [tapas.example.yml](tapas.example.yml).
 
 ## Documentation
 
-- [Configuration](docs/configuration.md): samplers, `of`, `deps`, names, time windows and cycles.
+- [Configuration](docs/configuration.md): samplers, `of`, `deps`, foreign keys, names, time windows and cycles, and
+  [one file with every option](docs/configuration.md#everything-in-one-file).
 - [Sanitization](docs/sanitization.md): replacing sensitive values with fakes, fixed values or templates.
 - [Command line](docs/cli.md): every flag, connection URLs and their environment variables, and what the output
   looks like.

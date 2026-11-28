@@ -12,6 +12,7 @@ tapas [OPTIONS] <CONFIGS>...
 | `-o`, `--output <FILE>` | | The SQL file to write, gzipped if `<FILE>` ends in `.gz`. This or `--target`, unless `--plan`. |
 | `--target <URL>` | | The database to write into. This or `--output`, unless `--plan`. |
 | `--since <SPAN>` | | How far back samplers with a `since` limit reach. |
+| `--disable-foreign-keys` | | Follow only the config's `deps` and `of`, not the source's foreign keys. |
 | `--plan` | | Print the plan and stop, without connecting. |
 | `--connections <N>` | `8` | The most connections open to the source at once. |
 | `--chunk-size <N>` | `5000` | Values per `IN (...)` list. |
@@ -99,6 +100,12 @@ A span of days, weeks, months or years, counted back from midnight today:
 As soon as any sampler has a `limit` with `since`, `--since` is required, so a forgotten flag never copies whole tables. Use
 `--since ever` when you do want everything.
 
+## `--disable-foreign-keys`
+
+By default tapas reads the source's foreign keys, with one query, and follows them as well as the config's `deps`.
+`--disable-foreign-keys` follows only the config's, and overrides `foreign_keys: true` in the config. See
+[Foreign keys](configuration.md#foreign-keys).
+
 ## `--sanitize-seed`
 
 Any text, which [fake values](sanitization.md#consistent-fakes) start from. With the same seed, the same original
@@ -150,11 +157,13 @@ The database's own messages can quote a value with or without `--debug`, such as
 
 ## `--plan`
 
-Prints every table in the order tapas would run it, with the queries its samplers send. It doesn't connect, but it
-writes the queries for the kind of database `--source` names, or for MySQL without `--source`:
+Prints every table in the order tapas would run it, with the queries its samplers send. Without `--source` it doesn't
+connect, and writes the queries for MySQL, and for lack of a source it can't read the foreign keys, which the first
+line says. With `--source` it connects only to read them, and writes the queries for that kind of database:
 
 ```
 $ tapas tapas.example.yml --since '2 weeks' --plan
+foreign keys: not read, since --source wasn't given
 5 tables, 7 samplers, 1 with a since
 --since 2 weeks: limits 1 samplers
 sanitize: 1 rules for every table, from tapas.example.yml
