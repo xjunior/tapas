@@ -259,10 +259,9 @@ impl MySqlTarget {
         let (sender, mut receiver) = mpsc::channel::<Vec<u8>>(256);
         let task = tokio::spawn(async move {
             while let Some(statement) = receiver.recv().await {
-                connection
-                    .query_drop(statement.as_slice())
-                    .await
-                    .with_context(|| format!("running {}", refused(&statement, debug)))?;
+                if let Err(error) = connection.query_drop(statement.as_slice()).await {
+                    return Err(mysql_refusal(&mut connection, &statement, error, debug).await);
+                }
             }
             Ok(connection)
         });
@@ -337,10 +336,18 @@ impl PostgresTarget {
             while let Some(statement) = receiver.recv().await {
                 // Postgres sends text, so its values, and the statements made of them, are UTF-8.
                 let statement = str::from_utf8(&statement).context("a statement isn't UTF-8")?;
-                client
-                    .batch_execute(statement)
-                    .await
-                    .with_context(|| format!("running {}", refused(statement.as_bytes(), debug)))?;
+                // A refused statement aborts the transaction. With debug, a savepoint before it
+                // lets its rows run again one at a time.
+                let ran = if debug {
+                    client
+                        .batch_execute(&format!("SAVEPOINT {SAVEPOINT};\n{statement}"))
+                        .await
+                } else {
+                    client.batch_execute(statement).await
+                };
+                if let Err(error) = ran {
+                    return Err(postgres_refusal(&client, statement, error, debug).await);
+                }
             }
             Ok(client)
         });
@@ -376,6 +383,56 @@ impl PostgresTarget {
         }
         Ok(())
     }
+}
+
+/// The savepoint a Postgres target sets before each statement with `debug`.
+const SAVEPOINT: &str = "tapas_debug";
+
+/// The error for a `statement` the MySQL target refused with `error`. With `debug`, it runs the
+/// statement's rows one at a time, and shows the first one the target refuses, with its reason.
+async fn mysql_refusal(
+    connection: &mut Conn,
+    statement: &[u8],
+    error: mysql_async::Error,
+    debug: bool,
+) -> anyhow::Error {
+    if debug {
+        // MySQL undoes a refused statement whole, so none of its rows went in yet.
+        for row in sql::split_insert(Dialect::MySql, statement) {
+            if let Err(row_error) = connection.query_drop(row.as_slice()).await {
+                return anyhow::Error::new(row_error)
+                    .context(format!("running {}", refused(&row, debug)));
+            }
+        }
+    }
+    anyhow::Error::new(error).context(format!("running {}", refused(statement, debug)))
+}
+
+/// The error for a `statement` the Postgres target refused with `error`. With `debug`, it goes
+/// back to the savepoint set before the statement, runs its rows one at a time, and shows the
+/// first one the target refuses, with its reason.
+async fn postgres_refusal(
+    client: &Client,
+    statement: &str,
+    error: tokio_postgres::Error,
+    debug: bool,
+) -> anyhow::Error {
+    let rolled_back = debug
+        && client
+            .batch_execute(&format!("ROLLBACK TO SAVEPOINT {SAVEPOINT}"))
+            .await
+            .is_ok();
+    if rolled_back {
+        for row in sql::split_insert(Dialect::Postgres, statement.as_bytes()) {
+            let row =
+                String::from_utf8(row).expect("splitting UTF-8 at ASCII bytes keeps it UTF-8");
+            if let Err(row_error) = client.batch_execute(&row).await {
+                return anyhow::Error::new(row_error)
+                    .context(format!("running {}", refused(row.as_bytes(), debug)));
+            }
+        }
+    }
+    anyhow::Error::new(error).context(format!("running {}", refused(statement.as_bytes(), debug)))
 }
 
 /// A refused INSERT statement, as its error shows it: in full with `debug`, or else its first

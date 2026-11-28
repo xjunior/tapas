@@ -420,3 +420,48 @@ async fn says_why_the_target_refused_a_statement() -> Result<()> {
     drop_databases(&admin, databases).await?;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn debug_shows_the_row_the_target_refused() -> Result<()> {
+    let Ok(base) = env::var("TAPAS_TEST_POSTGRES_URL") else {
+        eprintln!("TAPAS_TEST_POSTGRES_URL not set, skipping");
+        return Ok(());
+    };
+    let databases = ["tapas_pg_row_source", "tapas_pg_row_target"];
+    let admin = create_databases(&base, databases).await?;
+    // Orders total 9.5, 19 or 28.5, and the target only takes the first two.
+    connect(&format!("{base}/{}", databases[1]))
+        .await?
+        .batch_execute("ALTER TABLE orders ADD CONSTRAINT small CHECK (total < 28)")
+        .await?;
+    let config: Config = "samplers:\n  - table: orders\n".parse()?;
+
+    let error = tapas::run(
+        Plan::try_new(config, None)?,
+        &format!("{base}/{}", databases[0]),
+        2,
+        &Output::Database(format!("{base}/{}", databases[1])),
+        Options {
+            debug: true,
+            ..Options::default()
+        },
+    )
+    .await
+    .expect_err("the target refuses totals of 28 and over");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("OVERRIDING SYSTEM VALUE VALUES\n('") && message.contains("'28.5'"),
+        "shows the refused row: {message}"
+    );
+    assert!(
+        !message.contains("),\n("),
+        "leaves out the rows the target took: {message}"
+    );
+    assert!(
+        message.contains(r#"violates check constraint "small""#),
+        "gives the target's reason: {message}"
+    );
+
+    drop_databases(&admin, databases).await?;
+    Ok(())
+}

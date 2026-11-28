@@ -130,20 +130,20 @@ Caused by:
     1: Server error: `ERROR 1406 (22001): Data too long for column 'name' at row 3'
 ```
 
-With `--debug`, the query shows its values, and the error shows the whole statement, so you can see which row the
-target refused:
+With `--debug`, a failed query shows its values. When the target refuses a statement, tapas runs its rows again one
+at a time, and shows the first one the target refuses, with the target's reason for it:
 
 ```
 Caused by:
     0: running INSERT INTO `users` (`id`, `name`) VALUES
-       (1, 'ana'),
-       (2, 'bo'),
        (3, 'Maximiliana');
-    1: Server error: `ERROR 1406 (22001): Data too long for column 'name' at row 3'
+    1: Server error: `ERROR 1406 (22001): Data too long for column 'name' at row 1'
 ```
 
-The rows are as tapas writes them, so [sanitized](sanitization.md) columns hold their replacements. A statement holds
-up to `--batch-rows` rows; add `--batch-rows 1` to narrow the error down to one row.
+If every row goes in on its own, as when two rows of the statement clash with each other, the error shows the whole
+statement instead. On Postgres, running the rows again takes a savepoint before each statement.
+
+The rows are as tapas writes them, so [sanitized](sanitization.md) columns hold their replacements.
 
 The database's own messages can quote a value with or without `--debug`, such as MySQL's
 `Duplicate entry '5' for key 'users.PRIMARY'` or Postgres's `Failing row contains (…)`.

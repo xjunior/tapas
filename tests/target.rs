@@ -159,3 +159,57 @@ async fn says_why_the_target_refused_a_statement() -> Result<()> {
     connection.disconnect().await?;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn debug_shows_the_row_the_target_refused() -> Result<()> {
+    let Ok(base) = env::var("TAPAS_TEST_DATABASE_URL") else {
+        eprintln!("TAPAS_TEST_DATABASE_URL not set, skipping");
+        return Ok(());
+    };
+
+    // One name is too long for the target, and all four rows go in one statement.
+    let mut connection = Conn::new(Opts::from_url(&base)?).await?;
+    connection
+        .query_drop(
+            "DROP DATABASE IF EXISTS tapas_row_source; CREATE DATABASE tapas_row_source;
+             DROP DATABASE IF EXISTS tapas_row_target; CREATE DATABASE tapas_row_target;
+             CREATE TABLE tapas_row_source.users (id BIGINT PRIMARY KEY, name VARCHAR(100));
+             CREATE TABLE tapas_row_target.users (id BIGINT PRIMARY KEY, name VARCHAR(5));
+             INSERT INTO tapas_row_source.users
+               VALUES (1, 'ana'), (2, 'bo'), (3, 'Maximiliana'), (4, 'di');",
+        )
+        .await?;
+
+    let config: Config = "samplers:\n  - table: users\n".parse()?;
+    let error = tapas::run(
+        Plan::try_new(config, None)?,
+        &format!("{base}/tapas_row_source"),
+        2,
+        &Output::Database(format!("{base}/tapas_row_target")),
+        Options {
+            debug: true,
+            ..Options::default()
+        },
+    )
+    .await
+    .expect_err("the target's names are too short");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("running INSERT INTO `users` (`id`, `name`) VALUES\n(3, 'Maximiliana');"),
+        "shows the refused row: {message}"
+    );
+    assert!(
+        !message.contains("'ana'"),
+        "leaves out the rows the target took: {message}"
+    );
+    assert!(
+        message.contains("Data too long for column 'name'"),
+        "gives the target's reason: {message}"
+    );
+
+    connection
+        .query_drop("DROP DATABASE tapas_row_source; DROP DATABASE tapas_row_target")
+        .await?;
+    connection.disconnect().await?;
+    Ok(())
+}

@@ -396,6 +396,47 @@ fn select(
     sql
 }
 
+/// Splits an INSERT that `insert` built into one INSERT per row, in order, so the rows can run
+/// one at a time.
+#[must_use]
+pub fn split_insert(dialect: Dialect, statement: &[u8]) -> Vec<Vec<u8>> {
+    // The first line names the table and columns; each row is a `(...)` after it. Only quoted
+    // literals can hold parentheses, so a scan that skips them finds every row.
+    let Some(newline) = statement.iter().position(|&byte| byte == b'\n') else {
+        return Vec::new();
+    };
+    let head = &statement[..=newline];
+    let mut rows = Vec::new();
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut row_start = 0;
+    for (index, &byte) in statement.iter().enumerate().skip(head.len()) {
+        if quoted {
+            match (dialect, byte) {
+                _ if escaped => escaped = false,
+                (Dialect::MySql, b'\\') => escaped = true,
+                // A doubled quote ends the literal and starts it again, which leaves it open.
+                (Dialect::MySql | Dialect::Postgres, b'\'') => quoted = false,
+                (Dialect::MySql | Dialect::Postgres, _) => {}
+            }
+            continue;
+        }
+        match byte {
+            b'\'' => quoted = true,
+            b'(' => row_start = index,
+            b')' => {
+                let mut row = Vec::with_capacity(head.len() + index - row_start + 3);
+                row.extend_from_slice(head);
+                row.extend_from_slice(&statement[row_start..=index]);
+                row.extend_from_slice(b";\n");
+                rows.push(row);
+            }
+            _ => {}
+        }
+    }
+    rows
+}
+
 /// What a SQL file of the sample starts with: the settings that let its INSERTs load in any
 /// order.
 #[must_use]
@@ -933,6 +974,41 @@ mod tests {
             footer.starts_with("\nDO $tapas1$") && footer.contains("\n$tapas1$;\n"),
             "{footer}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn splits_an_insert_into_one_per_row() -> Result<(), Utf8Error> {
+        let columns = vec!["id".to_string(), "note".to_string()];
+        for dialect in [Dialect::MySql, Dialect::Postgres] {
+            // Quotes, parentheses, commas and newlines inside values don't end a row.
+            let notes: [&[u8]; 4] = [b"it's (a), b", b"line\n(two)", b"x'),\n('y", b"ends in \\"];
+            let rows: Vec<Vec<Vec<u8>>> = notes
+                .iter()
+                .enumerate()
+                .map(|(id, note)| {
+                    let id = id.to_string().into_bytes();
+                    vec![
+                        literal(dialect, Kind::Number, Some(&id)),
+                        literal(dialect, Kind::Text, Some(note)),
+                    ]
+                })
+                .collect();
+            let statement = insert(dialect, "notes", &columns, &rows);
+            let split = split_insert(dialect, &statement);
+            let expected: Vec<Vec<u8>> = rows
+                .iter()
+                .map(|row| insert(dialect, "notes", &columns, std::slice::from_ref(row)))
+                .collect();
+            assert_eq!(
+                split.len(),
+                expected.len(),
+                "{dialect}: one statement per row"
+            );
+            for (got, want) in split.iter().zip(&expected) {
+                assert_eq!(text(got)?, text(want)?, "{dialect}");
+            }
+        }
         Ok(())
     }
 }
