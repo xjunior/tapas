@@ -1175,6 +1175,71 @@ samplers:
 "#;
 
     #[test]
+    fn composite_deps_pull_in_the_rows_they_point_at() -> Result<()> {
+        let plan = plan(
+            r#"
+samplers:
+  - table: memberships
+    limit: 10
+    deps:
+      - { tenant_id: users.tenant_id, user_id: users.id }
+"#,
+        )?;
+        let composite = Columns::new(vec!["tenant_id".to_string(), "id".to_string()]);
+        let child = Columns::new(vec!["tenant_id".to_string(), "user_id".to_string()]);
+
+        let pulled = &plan.samplers[plan.tables["users"].samplers[0]];
+        assert_eq!(
+            pulled.origin,
+            "pulled in by memberships.(tenant_id, user_id)"
+        );
+        assert_eq!(
+            pulled.of[&composite].to_string(),
+            "memberships.(tenant_id, user_id)"
+        );
+        assert_eq!(plan.tables["memberships"].keep, BTreeSet::from([child]));
+        assert_eq!(
+            plan.references("users"),
+            BTreeSet::from(["id", "tenant_id"]),
+            "sanitizing either column would break the reference"
+        );
+        assert_eq!(
+            plan.references("memberships"),
+            BTreeSet::from(["tenant_id", "user_id"])
+        );
+        let described = plan.describe(Dialect::MySql);
+        assert!(
+            described.contains("(`tenant_id`, `id`) IN (<memberships.(tenant_id, user_id)>)"),
+            "{described}"
+        );
+        assert!(
+            described.contains("keeps (tenant_id, user_id)"),
+            "{described}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn composite_and_single_references_to_one_table_stay_apart() -> Result<()> {
+        let plan = plan(
+            r#"
+samplers:
+  - table: tasks
+    limit: all
+    deps:
+      - { tenant_id: users.tenant_id, user_id: users.id }
+      - { created_by: users.id }
+"#,
+        )?;
+        assert_eq!(
+            plan.tables["users"].samplers.len(),
+            2,
+            "one pull for each reference"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn deps_pull_in_the_rows_they_point_at() -> Result<()> {
         let plan = plan_since(REFERENCES, "2 weeks")?;
 

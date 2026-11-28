@@ -36,8 +36,8 @@ typo like `limt: 100` never goes unnoticed.
 | `limit` | How far the sampler reaches: `all`, a row count, or `since`. See [Limits](#limits). |
 | `where` | A plain SQL condition, such as `state <> 'draft'`, in the source's SQL. Needs a `limit` or `of`. |
 | `order_by` | Plain SQL, such as `id DESC`, in the source's SQL. Mostly useful with a row count. Needs a `limit` or `of`. |
-| `of` | `my_column: table.column`. Only rows that belong to rows already in the sample. |
-| `deps` | `my_column: table.column`. The rows this table points at come along. |
+| `of` | `my_column: table.column`. Only rows that belong to rows already in the sample. Several columns: [a list of maps](#several-columns). |
+| `deps` | `my_column: table.column`. The rows this table points at come along. Several columns: [a list of maps](#several-columns). |
 | `name` | Lets an `of` follow just this sampler's rows. |
 
 A table gets every row any of its samplers picks, each row once. Add as many samplers per table as you need:
@@ -111,6 +111,27 @@ A few things follow from that:
 - A table that already takes every row isn't pulled again.
 - A sampler with only `deps` takes no rows. The table's rows come only from its other samplers and from `deps` that
   point at it.
+
+### Several columns
+
+A key made of several columns is one reference. Write it as a list item, with every column pointing at the same
+table:
+
+```yaml
+- table: memberships
+  limit: 100
+  deps:
+    - { tenant_id: users.tenant_id, user_id: users.id }   # one reference: the user of that tenant
+    - { created_by: users.id }                             # another
+- table: notes
+  of:
+    - { tenant_id: users.tenant_id, user_id: users.id }
+```
+
+A plain map such as `deps: { user_id: users.id }` is a list of one-column references, so each entry stands alone.
+The order you write the columns in doesn't matter, and two references may share a column, as `tenant_id` often is.
+A row whose key has a NULL column points at nothing, so it brings nothing along. This is how a foreign key with
+`MATCH SIMPLE`, the default, behaves too.
 
 | You want | Write |
 | --- | --- |

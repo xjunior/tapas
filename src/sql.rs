@@ -318,14 +318,9 @@ pub fn sampler_queries(
     let mut combinations: Vec<Vec<Vec<u8>>> = vec![Vec::new()];
 
     for Dep { columns, allowed } in deps {
-        let column = columns
-            .single()
-            .expect("config only builds single-column references so far");
         match allowed {
             Allowed::AnyValue => {
-                let mut condition = Vec::with_capacity(column.len() + 14);
-                push_identifier(&mut condition, dialect, column);
-                condition.extend_from_slice(b" IS NOT NULL");
+                let condition = not_null(dialect, columns);
                 for conditions in &mut combinations {
                     conditions.push(condition.clone());
                 }
@@ -334,7 +329,7 @@ pub fn sampler_queries(
             Allowed::Values(values) => {
                 let chunks: Vec<Vec<u8>> = values
                     .chunks(chunk_size)
-                    .map(|chunk| in_list(dialect, column, chunk))
+                    .map(|chunk| in_list(dialect, columns, chunk))
                     .collect();
                 combinations = combinations
                     .into_iter()
@@ -356,11 +351,44 @@ pub fn sampler_queries(
         .collect()
 }
 
+/// Writes `columns` as a SELECT does: a column by itself, or several in parentheses.
+fn push_columns(out: &mut Vec<u8>, dialect: Dialect, columns: &Columns) {
+    let several = columns.as_slice().len() > 1;
+    if several {
+        out.push(b'(');
+    }
+    for (index, column) in columns.iter().enumerate() {
+        if index > 0 {
+            out.extend_from_slice(b", ");
+        }
+        push_identifier(out, dialect, column);
+    }
+    if several {
+        out.push(b')');
+    }
+}
+
+/// Returns the condition that every one of `columns` is set, since a key with a NULL part points
+/// at nothing.
 #[must_use]
-fn in_list(dialect: Dialect, column: &str, values: &[Vec<u8>]) -> Vec<u8> {
+fn not_null(dialect: Dialect, columns: &Columns) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (index, column) in columns.iter().enumerate() {
+        if index > 0 {
+            out.extend_from_slice(b" AND ");
+        }
+        push_identifier(&mut out, dialect, column);
+        out.extend_from_slice(b" IS NOT NULL");
+    }
+    out
+}
+
+/// Returns `columns IN (values)`. A composite key's values are tuples, such as `(1, 2)`.
+#[must_use]
+fn in_list(dialect: Dialect, columns: &Columns, values: &[Vec<u8>]) -> Vec<u8> {
     let value_bytes: usize = values.iter().map(|value| value.len() + 2).sum();
-    let mut out = Vec::with_capacity(column.len() + value_bytes + 8);
-    push_identifier(&mut out, dialect, column);
+    let mut out = Vec::with_capacity(columns.as_slice().len() * 16 + value_bytes + 8);
+    push_columns(&mut out, dialect, columns);
     out.extend_from_slice(b" IN (");
     for (index, value) in values.iter().enumerate() {
         if index > 0 {
@@ -584,6 +612,13 @@ mod tests {
         }
     }
 
+    fn composite(columns: &[&str], allowed: Allowed) -> Dep {
+        Dep {
+            columns: Columns::new(columns.iter().map(|column| column.to_string()).collect()),
+            allowed,
+        }
+    }
+
     fn values(items: &[&str]) -> Allowed {
         Allowed::Values(items.iter().map(|item| item.as_bytes().to_vec()).collect())
     }
@@ -725,6 +760,50 @@ mod tests {
             text(&sampler_queries(Dialect::MySql, &orders, time_filter, &deps, 10)[0])?,
             "SELECT * FROM `orders` WHERE (total > 0) AND `created_at` >= CURDATE() - INTERVAL 2 WEEK \
              AND `user_id` IN (1)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn composite_deps_compare_row_values() -> Result<(), Utf8Error> {
+        let sampler = Sampler {
+            table: "memberships".to_string(),
+            ..Sampler::default()
+        };
+        let deps = [composite(
+            &["tenant_id", "user_id"],
+            values(&["(1, 2)", "(1, 3)"]),
+        )];
+        assert_eq!(
+            text(&sampler_queries(Dialect::MySql, &sampler, None, &deps, 10)[0])?,
+            "SELECT * FROM `memberships` WHERE (`tenant_id`, `user_id`) IN ((1, 2), (1, 3))"
+        );
+        assert_eq!(
+            text(&sampler_queries(Dialect::Postgres, &sampler, None, &deps, 10)[0])?,
+            "SELECT * FROM \"memberships\" WHERE (\"tenant_id\", \"user_id\") IN ((1, 2), (1, 3))"
+        );
+        assert_eq!(
+            sampler_queries(Dialect::MySql, &sampler, None, &deps, 1).len(),
+            2,
+            "chunks count tuples, not columns"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn composite_deps_that_allow_any_need_every_column() -> Result<(), Utf8Error> {
+        let sampler = Sampler {
+            table: "memberships".to_string(),
+            ..Sampler::default()
+        };
+        let deps = [
+            composite(&["tenant_id", "user_id"], Allowed::AnyValue),
+            dep("shop_id", values(&["7"])),
+        ];
+        assert_eq!(
+            text(&sampler_queries(Dialect::MySql, &sampler, None, &deps, 10)[0])?,
+            "SELECT * FROM `memberships` WHERE `tenant_id` IS NOT NULL \
+             AND `user_id` IS NOT NULL AND `shop_id` IN (7)"
         );
         Ok(())
     }

@@ -467,3 +467,84 @@ async fn debug_shows_the_row_the_target_refused() -> Result<()> {
     drop_databases(&admin, databases).await?;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn follows_references_over_several_columns() -> Result<()> {
+    let Ok(base) = env::var("TAPAS_TEST_POSTGRES_URL") else {
+        eprintln!("TAPAS_TEST_POSTGRES_URL not set, skipping");
+        return Ok(());
+    };
+    // Every tenant has users 1 and 2, so a user's id alone doesn't say which user it is.
+    const COMPOSITE_SCHEMA: &str = r#"
+CREATE TABLE users (tenant_id integer NOT NULL, id integer NOT NULL, PRIMARY KEY (tenant_id, id));
+CREATE TABLE memberships (id integer PRIMARY KEY, tenant_id integer NOT NULL, user_id integer);
+"#;
+    const COMPOSITE_SEED: &str = r#"
+INSERT INTO users VALUES (1, 1), (1, 2), (2, 1), (2, 2);
+INSERT INTO memberships VALUES (1, 1, 2), (2, 2, 1), (3, 1, NULL);
+"#;
+    let databases = ["tapas_pg_composite_source", "tapas_pg_composite_target"];
+    let admin = connect(&format!("{base}/postgres")).await?;
+    for database in databases {
+        admin
+            .batch_execute(&format!("DROP DATABASE IF EXISTS {database} WITH (FORCE)"))
+            .await?;
+        admin
+            .batch_execute(&format!("CREATE DATABASE {database}"))
+            .await?;
+        let client = connect(&format!("{base}/{database}")).await?;
+        client.batch_execute(COMPOSITE_SCHEMA).await?;
+        if database == databases[0] {
+            client.batch_execute(COMPOSITE_SEED).await?;
+        }
+    }
+
+    let config: Config = r#"
+samplers:
+  - table: memberships
+    where: id <= 3
+    limit: all
+    deps:
+      - { tenant_id: users.tenant_id, user_id: users.id }
+"#
+    .parse()?;
+    let output = env::temp_dir().join(format!("tapas-pg-composite-{}.sql", process::id()));
+    tapas::run(
+        Plan::try_new(config, None)?,
+        &format!("{base}/{}", databases[0]),
+        4,
+        &Output::File(output.clone()),
+        Options {
+            chunk_size: 1,
+            ..Options::default()
+        },
+    )
+    .await?;
+    let sample = fs::read_to_string(&output)?;
+    fs::remove_file(&output)?;
+    let target = connect(&format!("{base}/{}", databases[1])).await?;
+    target.batch_execute(&sample).await?;
+
+    let users = rows(&target, "SELECT tenant_id, id FROM users ORDER BY 1, 2").await?;
+    let users: Vec<(&str, &str)> = users
+        .iter()
+        .map(|row| {
+            (
+                row[0].as_deref().unwrap_or_default(),
+                row[1].as_deref().unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        users,
+        [("1", "2"), ("2", "1")],
+        "only the users the memberships point at"
+    );
+    assert_eq!(
+        scalar(&target, "SELECT count(*) FROM memberships").await?,
+        "3"
+    );
+
+    drop_databases(&admin, databases).await?;
+    Ok(())
+}
