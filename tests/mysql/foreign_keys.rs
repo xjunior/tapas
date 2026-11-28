@@ -207,7 +207,11 @@ async fn reads_every_foreign_key_of_the_database() -> Result<()> {
 fn plan_of(name: &str, config: &str, args: &[&str]) -> Result<String> {
     let path = env::temp_dir().join(format!("tapas-{name}-{}.yml", process::id()));
     fs::write(&path, config)?;
-    let output = Command::new(env!("CARGO_BIN_EXE_tapas"))
+    // nextest sets the variable to wherever it unpacked the binary; `env!` is the path where
+    // the tests were built, which is gone when they run from an archive on another machine.
+    let binary =
+        env::var("CARGO_BIN_EXE_tapas").unwrap_or_else(|_| env!("CARGO_BIN_EXE_tapas").to_string());
+    let output = Command::new(binary)
         .arg(&path)
         .arg("--plan")
         .args(args)
