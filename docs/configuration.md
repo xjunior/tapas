@@ -14,7 +14,7 @@ A table with no sampler, or a sampler with no `limit` and no `of`, brings no row
 when another table's [`deps`](#of-and-deps) point at it.
 
 A config can also say how to replace sensitive values, under `sanitize:` (see [Sanitization](sanitization.md)), and
-where references come from, under `deps:` (see [Foreign keys](#foreign-keys)).
+whether to follow foreign keys, under `foreign_keys:` (see [Foreign keys](#foreign-keys)).
 
 ## Files
 
@@ -141,11 +141,10 @@ A row whose key has a NULL column points at nothing, so it brings nothing along.
 
 ## Foreign keys
 
-Most schemas already say what points at what. Set `deps: foreign_keys` at the top of a config, or pass
-[`--deps foreign-keys`](cli.md#--deps), and tapas reads the source's foreign keys and follows them like `deps`:
+Most schemas already say what points at what, so tapas reads the source's foreign keys and follows them like `deps`.
+This config needs no `deps` at all:
 
 ```yaml
-deps: foreign_keys
 samplers:
   - table: orders
     limit: { since: created_at }   # every user, territory and so on the orders point at comes along
@@ -162,8 +161,9 @@ config sampler #1 (orders): orders.user_id points at accounts.id, but foreign ke
 points at users.id
 ```
 
-`deps: declared` is the default, and `--deps` overrides the config. When several files set `deps`, they must agree.
-Foreign keys need the source, so `--plan` needs `--source` too.
+To follow only the `deps` and `of` you declare, write `foreign_keys: false` at the top of a config, or pass
+[`--disable-foreign-keys`](cli.md#--disable-foreign-keys), which also overrides `foreign_keys: true`. When several
+files set `foreign_keys`, they must agree.
 
 ## Time windows
 

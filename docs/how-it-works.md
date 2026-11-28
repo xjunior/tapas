@@ -25,7 +25,7 @@ This page is for people changing tapas.
    sampler with no `limit` and no `of` takes no rows, so it never runs; its `deps` still count.
 2. Each `deps` reference, `table.column → parent.column`, becomes one extra sampler on the parent:
    `of: { parent.column: table.column }`. A reference over several columns stays one reference. A parent that already takes every row gets none.
-   With `--deps foreign-keys`, `run::foreign_keys` first reads the source's foreign keys in one query. The plan starts
+   Unless `--disable-foreign-keys` or `foreign_keys: false` says no, `run::foreign_keys` first reads the source's foreign keys in one query. The plan starts
    from the tables the samplers and their `deps` name, adds the keys of each, and follows them to their parents until
    nothing new turns up. A key becomes a reference like a `deps` entry, unless a `deps` entry says the same.
 3. Each `of` adds an edge from the parent table to the child. A named sampler stands for its table.

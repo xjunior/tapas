@@ -29,7 +29,7 @@ docker rm -f tapas-mysql tapas-postgres
 | --- | --- |
 | `tests/end_to_end.rs` | Several samplers per table, limits across chunks, `--since`, and values that make the trip unchanged. |
 | `tests/references.rs` | `deps` pulling in the rows it points at, whatever the parent's own filters. |
-| `tests/foreign_keys.rs` | Reading foreign keys, following them like the `deps` that say the same, and `--deps` without a source. |
+| `tests/foreign_keys.rs` | Reading foreign keys, following them like the `deps` that say the same, and turning them off with `--disable-foreign-keys` and `foreign_keys: false`. |
 | `tests/composite.rs` | `of` and `deps` over several columns, where a user's id alone doesn't say which user it is. |
 | `tests/reach.rs` | `limit` with `rows` and `since` together, and tables that only `deps` pull in. |
 | `tests/target.rs` | Writing straight into a target database, refusing to write into the source, and what errors show of a refused statement. |

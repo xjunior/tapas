@@ -220,32 +220,71 @@ async fn reads_every_foreign_key_of_the_database() -> Result<()> {
     Ok(())
 }
 
-/// Runs the tapas binary on `config` with `args`, and returns what it printed to stderr if it
-/// failed.
-fn failure_of(name: &str, config: &str, args: &[&str]) -> Result<String> {
+/// Runs the tapas binary on `config` with `args`, and returns what it printed to stdout.
+fn plan_of(name: &str, config: &str, args: &[&str]) -> Result<String> {
     let path = env::temp_dir().join(format!("tapas-{name}-{}.yml", process::id()));
     fs::write(&path, config)?;
     let output = Command::new(env!("CARGO_BIN_EXE_tapas"))
         .arg(&path)
+        .arg("--plan")
         .args(args)
         .output()?;
     fs::remove_file(&path)?;
-    assert!(!output.status.success(), "tapas should fail");
-    Ok(String::from_utf8(output.stderr)?)
+    assert!(
+        output.status.success(),
+        "tapas failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(String::from_utf8(output.stdout)?)
 }
 
 #[test]
-fn foreign_keys_need_a_source_even_for_the_plan() -> Result<()> {
-    let message = "--deps foreign-keys reads the foreign keys from --source; pass it";
+fn a_plan_without_a_source_says_it_did_not_read_the_foreign_keys() -> Result<()> {
+    let note = "foreign keys: not read, since --source wasn't given";
 
-    let error = failure_of("fk_flag", ORDERS, &["--plan", "--deps", "foreign-keys"])?;
-    assert!(error.contains(message), "{error}");
+    let plan = plan_of("fk_default", ORDERS, &[])?;
+    assert!(plan.starts_with(note), "following is the default: {plan}");
 
-    let config = format!("deps: foreign_keys\n{ORDERS}");
-    let error = failure_of("fk_yaml", &config, &["--plan"])?;
-    assert!(
-        error.contains(message),
-        "the config asks for it too: {error}"
-    );
+    let plan = plan_of("fk_flag", ORDERS, &["--disable-foreign-keys"])?;
+    assert!(!plan.contains(note), "nothing to read: {plan}");
+
+    let config = format!("foreign_keys: false\n{ORDERS}");
+    let plan = plan_of("fk_yaml", &config, &[])?;
+    assert!(!plan.contains(note), "the config turns it off too: {plan}");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_plan_follows_foreign_keys_unless_disabled() -> Result<()> {
+    let Some(base) = database_url() else {
+        return Ok(());
+    };
+    let database = "tapas_fk_plan";
+    let mut connection = Conn::new(Opts::from_url(&base)?).await?;
+    recreate(&mut connection, database).await?;
+    connection
+        .query_drop(format!("USE {database}; {SCHEMA}"))
+        .await?;
+    let source = format!("{base}/{database}");
+    let pull = "pulled in by foreign key orders_user_fk";
+
+    let plan = plan_of("fk_plan_on", ORDERS, &["--source", &source])?;
+    assert!(plan.contains(pull), "on by default: {plan}");
+
+    let plan = plan_of(
+        "fk_plan_flag",
+        ORDERS,
+        &["--source", &source, "--disable-foreign-keys"],
+    )?;
+    assert!(!plan.contains(pull), "--disable-foreign-keys: {plan}");
+
+    let config = format!("foreign_keys: false\n{ORDERS}");
+    let plan = plan_of("fk_plan_yaml", &config, &["--source", &source])?;
+    assert!(!plan.contains(pull), "foreign_keys: false: {plan}");
+
+    connection
+        .query_drop(format!("DROP DATABASE {database}"))
+        .await?;
+    connection.disconnect().await?;
     Ok(())
 }

@@ -82,7 +82,7 @@ impl Plan {
         let Config {
             mut samplers,
             sanitize,
-            deps: _,
+            foreign_keys: _,
         } = config;
         pull_referenced_rows(&mut samplers, since, foreign_keys)?;
 

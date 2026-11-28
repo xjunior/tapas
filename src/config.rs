@@ -22,42 +22,8 @@ pub struct Config {
     pub samplers: Vec<Sampler>,
     /// What to write in place of sensitive values.
     pub sanitize: Sanitize,
-    /// Where references come from, when a file says.
-    pub deps: Option<DepsSource>,
-}
-
-/// Where the references between tables come from.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DepsSource {
-    /// Only the `deps` and `of` the config declares.
-    #[default]
-    Declared,
-    /// The foreign keys of the source database, plus whatever the config declares.
-    ForeignKeys,
-}
-
-impl Display for DepsSource {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Declared => f.write_str("declared"),
-            Self::ForeignKeys => f.write_str("foreign_keys"),
-        }
-    }
-}
-
-impl FromStr for DepsSource {
-    type Err = String;
-
-    fn from_str(text: &str) -> Result<Self, Self::Err> {
-        match text {
-            "declared" => Ok(Self::Declared),
-            "foreign-keys" | "foreign_keys" => Ok(Self::ForeignKeys),
-            _ => Err(format!(
-                "`{text}` isn't where references come from; use `declared` or `foreign-keys`"
-            )),
-        }
-    }
+    /// Whether to follow the source's foreign keys, when a file says. Without one, tapas does.
+    pub foreign_keys: Option<bool>,
 }
 
 /// What one file holds. A file can hold only samplers, only `sanitize:`, or both.
@@ -68,7 +34,7 @@ struct File {
     samplers: Vec<Sampler>,
     #[serde(default)]
     sanitize: SanitizeFile,
-    deps: Option<DepsSource>,
+    foreign_keys: Option<bool>,
 }
 
 /// The `sanitize:` section of one file.
@@ -763,8 +729,8 @@ impl Config {
     /// one file; a file named twice is loaded once.
     pub fn load(patterns: &[String]) -> Result<Self> {
         let mut merged = Self::default();
-        // The file that set `deps` first, so a file that disagrees can name it.
-        let mut deps_file: Option<String> = None;
+        // The file that set `foreign_keys` first, so a file that disagrees can name it.
+        let mut foreign_keys_file: Option<String> = None;
         for path in expand(patterns)? {
             let text =
                 fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
@@ -772,16 +738,16 @@ impl Config {
                 .with_context(|| format!("parsing {}", path.display()))?;
             merged.samplers.extend(config.samplers);
             merged.sanitize.merge(config.sanitize)?;
-            if let Some(source) = config.deps {
-                match (merged.deps, &deps_file) {
-                    (Some(seen), Some(file)) if seen != source => bail!(
-                        "deps is {seen} in {file} and {source} in {}",
+            if let Some(follow) = config.foreign_keys {
+                match (merged.foreign_keys, &foreign_keys_file) {
+                    (Some(seen), Some(file)) if seen != follow => bail!(
+                        "foreign_keys is {seen} in {file} and {follow} in {}",
                         path.display()
                     ),
                     (Some(_), Some(_)) => {}
                     (_, _) => {
-                        merged.deps = Some(source);
-                        deps_file = Some(path.display().to_string());
+                        merged.foreign_keys = Some(follow);
+                        foreign_keys_file = Some(path.display().to_string());
                     }
                 }
             }
@@ -817,7 +783,7 @@ impl Config {
         Ok(Self {
             samplers,
             sanitize,
-            deps: file.deps,
+            foreign_keys: file.foreign_keys,
         })
     }
 }
@@ -1176,70 +1142,51 @@ samplers:
     }
 
     #[test]
-    fn a_file_says_where_references_come_from() -> Result<()> {
+    fn a_file_says_whether_to_follow_foreign_keys() -> Result<()> {
         let config: Config = "samplers:\n  - table: users\n    limit: all\n".parse()?;
         assert_eq!(
-            config.deps, None,
+            config.foreign_keys, None,
             "a config that doesn't say leaves it open"
         );
 
         let config: Config =
-            "deps: foreign_keys\nsamplers:\n  - table: users\n    limit: all\n".parse()?;
-        assert_eq!(config.deps, Some(DepsSource::ForeignKeys));
+            "foreign_keys: false\nsamplers:\n  - table: users\n    limit: all\n".parse()?;
+        assert_eq!(config.foreign_keys, Some(false));
         let config: Config =
-            "deps: declared\nsamplers:\n  - table: users\n    limit: all\n".parse()?;
-        assert_eq!(config.deps, Some(DepsSource::Declared));
+            "foreign_keys: true\nsamplers:\n  - table: users\n    limit: all\n".parse()?;
+        assert_eq!(config.foreign_keys, Some(true));
         Ok(())
     }
 
     #[test]
-    fn rejects_an_unknown_source_of_references() {
-        let error = "deps: keys\nsamplers:\n  - table: users\n    limit: all\n"
+    fn rejects_foreign_keys_that_are_not_true_or_false() {
+        let error = "foreign_keys: sometimes\nsamplers:\n  - table: users\n    limit: all\n"
             .parse::<Config>()
-            .expect_err("`keys` isn't a source of references");
-        assert!(
-            error
-                .to_string()
-                .contains("unknown variant `keys`, expected `declared` or `foreign_keys`"),
-            "{error}"
-        );
+            .expect_err("`sometimes` isn't a boolean");
+        assert!(error.to_string().contains("expected a boolean"), "{error}");
     }
 
     #[test]
-    fn parses_the_source_of_references_from_the_command_line() {
-        assert_eq!("declared".parse(), Ok(DepsSource::Declared));
-        assert_eq!("foreign-keys".parse(), Ok(DepsSource::ForeignKeys));
-        assert_eq!("foreign_keys".parse(), Ok(DepsSource::ForeignKeys));
-        assert_eq!(
-            "keys".parse::<DepsSource>(),
-            Err(
-                "`keys` isn't where references come from; use `declared` or `foreign-keys`"
-                    .to_string()
-            )
-        );
-    }
-
-    #[test]
-    fn files_must_agree_on_where_references_come_from() -> Result<()> {
-        let dir = TempDir::new("deps-source")?;
+    fn files_must_agree_on_whether_to_follow_foreign_keys() -> Result<()> {
+        let dir = TempDir::new("foreign-keys")?;
         let samplers = "samplers:\n  - table: users\n    limit: all\n";
-        let keys = dir.write("keys.yml", &format!("deps: foreign_keys\n{samplers}"))?;
-        let again = dir.write("again.yml", &format!("deps: foreign_keys\n{samplers}"))?;
+        let off = dir.write("off.yml", &format!("foreign_keys: false\n{samplers}"))?;
+        let again = dir.write("again.yml", &format!("foreign_keys: false\n{samplers}"))?;
         let silent = dir.write("silent.yml", samplers)?;
-        let declared = dir.write("declared.yml", &format!("deps: declared\n{samplers}"))?;
+        let on = dir.write("on.yml", &format!("foreign_keys: true\n{samplers}"))?;
 
-        let config = Config::load(&[keys.clone(), silent.clone(), again])?;
+        let config = Config::load(&[off.clone(), silent.clone(), again])?;
         assert_eq!(
-            config.deps,
-            Some(DepsSource::ForeignKeys),
+            config.foreign_keys,
+            Some(false),
             "a file that doesn't say takes nothing back"
         );
 
-        let error = Config::load(&[keys.clone(), silent, declared.clone()])
-            .expect_err("two files disagree");
+        let error =
+            Config::load(&[off.clone(), silent, on.clone()]).expect_err("two files disagree");
         assert_eq!(
             error.to_string(),
-            format!("deps is foreign_keys in {keys} and declared in {declared}")
+            format!("foreign_keys is false in {off} and true in {on}")
         );
         Ok(())
     }

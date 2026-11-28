@@ -4,9 +4,8 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::Context;
-use anyhow::{Result, bail};
+use anyhow::Result;
 use clap::Parser;
-use tapas::config::DepsSource;
 use tapas::sanitize::Seed;
 use tapas::sql::Dialect;
 use tapas::{Config, Options, Output, Plan, Since};
@@ -68,11 +67,10 @@ struct Args {
     #[arg(long, env = "TAPAS_SANITIZE_SEED", hide_env_values = true)]
     sanitize_seed: Option<Seed>,
 
-    /// Where references between tables come from: `declared` takes only the config's `deps` and
-    /// `of`; `foreign-keys` also follows the source's foreign keys, which needs --source even with
-    /// --plan. Overrides the config's `deps`.
+    /// Follow only the `deps` and `of` the config declares, not the source's foreign keys.
+    /// Overrides `foreign_keys: true` in the config.
     #[arg(long)]
-    deps: Option<DepsSource>,
+    disable_foreign_keys: bool,
 
     /// Show the values in errors, such as every row of an INSERT the target refused. Those rows
     /// are as tapas writes them, so sanitized columns hold their replacements.
@@ -80,11 +78,11 @@ struct Args {
     debug: bool,
 }
 
-/// Returns where references come from: the command line's choice, else the config's, else the
-/// declared `deps` and `of` alone.
+/// Returns whether to follow the source's foreign keys: always, unless the command line or the
+/// config turns it off.
 #[must_use]
-fn deps_source(command_line: Option<DepsSource>, config: Option<DepsSource>) -> DepsSource {
-    command_line.or(config).unwrap_or_default()
+fn follows_foreign_keys(disabled: bool, config: Option<bool>) -> bool {
+    !disabled && config.unwrap_or(true)
 }
 
 #[tokio::main]
@@ -93,15 +91,15 @@ async fn main() -> Result<()> {
     let started = Instant::now();
 
     let config = Config::load(&args.configs)?;
-    let foreign_keys = match deps_source(args.deps, config.deps) {
-        DepsSource::Declared => Vec::new(),
-        DepsSource::ForeignKeys => {
-            let Some(source) = args.source.as_deref() else {
-                bail!("--deps foreign-keys reads the foreign keys from --source; pass it");
-            };
-            tapas::foreign_keys(source).await?
+    let mut foreign_keys = Vec::new();
+    let mut unread = false;
+    if follows_foreign_keys(args.disable_foreign_keys, config.foreign_keys) {
+        match args.source.as_deref() {
+            Some(source) => foreign_keys = tapas::foreign_keys(source).await?,
+            // Only --plan runs without a source.
+            None => unread = true,
         }
-    };
+    }
     let plan = Plan::try_new_with_foreign_keys(config, args.since, &foreign_keys)?;
     if args.plan {
         let dialect = match args.source.as_deref() {
@@ -109,6 +107,9 @@ async fn main() -> Result<()> {
                 .context("--source must start with mysql:// or postgres://")?,
             None => Dialect::MySql,
         };
+        if unread {
+            println!("foreign keys: not read, since --source wasn't given");
+        }
         print!("{}", plan.describe(dialect));
         return Ok(());
     }
@@ -146,30 +147,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn deps_defaults_to_what_the_config_says() -> Result<()> {
+    fn foreign_keys_are_followed_unless_disabled() -> Result<()> {
         let args = Args::try_parse_from(["tapas", "tapas.yml", "--plan"])?;
-        assert_eq!(args.deps, None, "the config decides unless --deps is given");
+        assert!(!args.disable_foreign_keys, "foreign keys are on by default");
         let args =
-            Args::try_parse_from(["tapas", "tapas.yml", "--plan", "--deps", "foreign-keys"])?;
-        assert_eq!(args.deps, Some(DepsSource::ForeignKeys));
-        let error = Args::try_parse_from(["tapas", "tapas.yml", "--plan", "--deps", "keys"])
-            .expect_err("`keys` isn't a source of references");
-        assert!(
-            error
-                .to_string()
-                .contains("use `declared` or `foreign-keys`"),
-            "{error}"
-        );
+            Args::try_parse_from(["tapas", "tapas.yml", "--plan", "--disable-foreign-keys"])?;
+        assert!(args.disable_foreign_keys);
         Ok(())
     }
 
     #[test]
-    fn the_command_line_wins_over_the_config() {
-        use DepsSource::{Declared, ForeignKeys};
-        assert_eq!(deps_source(None, None), Declared);
-        assert_eq!(deps_source(None, Some(ForeignKeys)), ForeignKeys);
-        assert_eq!(deps_source(Some(Declared), Some(ForeignKeys)), Declared);
-        assert_eq!(deps_source(Some(ForeignKeys), Some(Declared)), ForeignKeys);
+    fn the_command_line_and_the_config_can_each_turn_foreign_keys_off() {
+        assert!(follows_foreign_keys(false, None), "on by default");
+        assert!(follows_foreign_keys(false, Some(true)));
+        assert!(
+            !follows_foreign_keys(false, Some(false)),
+            "the config turns it off"
+        );
+        assert!(
+            !follows_foreign_keys(true, None),
+            "the command line turns it off"
+        );
+        assert!(
+            !follows_foreign_keys(true, Some(true)),
+            "the command line wins over the config"
+        );
     }
 
     #[test]
