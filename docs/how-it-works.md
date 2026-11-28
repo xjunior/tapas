@@ -9,7 +9,7 @@ This page is for people changing tapas.
 | `config` | Loads the YAML files, expands globs, and labels each sampler with where it came from. |
 | `since` | Parses `--since` and turns a `limit`'s `since` into a SQL condition. |
 | `plan` | Validates the samplers, turns `deps` into samplers, finds cycles, and orders the tables. |
-| `sql` | Builds the queries, the `INSERT`s and the file's first and last lines, and writes values as literals, in MySQL's or Postgres's SQL. |
+| `sql` | Builds the queries, the `INSERT`s and the file's first and last lines, and writes values as literals. What differs between databases lives in one place per dialect (`sql/mysql.rs`, `sql/postgres.rs`), behind the `Syntax` trait. |
 | `sanitize` | Works out what each table's sanitize rules do to its columns, and rewrites rows to match. |
 | `fake` | Makes fake values from a seed. |
 | `extract` | Runs the plan: schedules samplers, streams rows, and keeps the values children need. |
