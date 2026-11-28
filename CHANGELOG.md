@@ -2,6 +2,21 @@
 
 Every notable change to tapas lands here. Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0](https://github.com/xjunior/tapas/compare/v0.3.0...v1.0.0) (2026-11-28)
+
+
+### ⚠ BREAKING CHANGES
+
+* a config that relied on its declared `deps` alone now also follows the source's foreign keys, which can bring more rows. Add `foreign_keys: false` to the config, or pass `--disable-foreign-keys`, to keep the old behaviour.
+* make limit say how far a sampler reaches ([#14](https://github.com/xjunior/tapas/issues/14))
+
+### Features
+
+* add --debug to show the values errors leave out ([#12](https://github.com/xjunior/tapas/issues/12)) ([bc017d3](https://github.com/xjunior/tapas/commit/bc017d3af970295127e4601e8400f7973d9c3d2e))
+* follow the source's foreign keys as deps ([#16](https://github.com/xjunior/tapas/issues/16)) ([6e705e6](https://github.com/xjunior/tapas/commit/6e705e6e93a4cb3428c5158ea4a08be7c4ec8b06))
+* let of and deps follow several columns ([#15](https://github.com/xjunior/tapas/issues/15)) ([56c9757](https://github.com/xjunior/tapas/commit/56c9757b5651b6792680fa8fbabc42712d1bafd2))
+* make limit say how far a sampler reaches ([#14](https://github.com/xjunior/tapas/issues/14)) ([961e170](https://github.com/xjunior/tapas/commit/961e1700113ef3b70fbb0d8b88e59bba10204a85))
+
 ## [0.3.0](https://github.com/xjunior/tapas/compare/v0.2.0...v0.3.0) (2026-11-27)
 
 
