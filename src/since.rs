@@ -78,10 +78,7 @@ impl Since {
         if !self.narrows(columns) {
             return None;
         }
-        let cutoff = match dialect {
-            Dialect::MySql => format!("CURDATE() - INTERVAL {amount} {}", unit.sql()),
-            Dialect::Postgres => format!("CURRENT_DATE - INTERVAL '{amount} {}'", unit.sql()),
-        };
+        let cutoff = dialect.cutoff(*amount, unit.sql());
         let mut checks: Vec<String> = columns
             .iter()
             .map(|column| format!("{} >= {cutoff}", sql::identifier(dialect, column)))
