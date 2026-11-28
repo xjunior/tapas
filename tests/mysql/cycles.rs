@@ -1,11 +1,9 @@
-//! Extracts tables that depend on each other. Needs TAPAS_TEST_DATABASE_URL, like end_to_end.rs.
-
-use std::{env, fs, process};
+//! Extracts tables that depend on each other.
 
 use anyhow::Result;
-use mysql_async::prelude::Queryable;
-use mysql_async::{Conn, Opts};
-use tapas::{Config, Options, Output, Plan, Since};
+use tapas::{Config, Options, Plan, Since};
+
+use super::support::{ids, sample, url};
 
 const SCHEMA: &str = r#"
 CREATE TABLE employees (id BIGINT PRIMARY KEY, manager_id BIGINT NULL);
@@ -65,46 +63,21 @@ samplers:
       id: recent_write_offs.project_id
 "#;
 
-async fn ids(connection: &mut Conn, table: &str) -> Result<Vec<u64>> {
-    let ids: Vec<u64> = connection
-        .query(format!("SELECT id FROM {table} ORDER BY id"))
-        .await?;
-    Ok(ids)
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn extracts_cycles_until_they_stop_growing() -> Result<()> {
-    let Ok(base) = env::var("TAPAS_TEST_DATABASE_URL") else {
-        eprintln!("TAPAS_TEST_DATABASE_URL not set, skipping");
+    let Some(base) = url() else {
         return Ok(());
     };
-
-    let mut connection = Conn::new(Opts::from_url(&base)?).await?;
-    for database in ["tapas_cycles_source", "tapas_cycles_target"] {
-        connection
-            .query_drop(format!(
-                "DROP DATABASE IF EXISTS {database}; CREATE DATABASE {database}"
-            ))
-            .await?;
-    }
-    connection
-        .query_drop(format!("USE tapas_cycles_source; {SCHEMA} {SEED}"))
-        .await?;
-    connection
-        .query_drop(format!("USE tapas_cycles_target; {SCHEMA}"))
-        .await?;
-
     let config: Config = SAMPLERS.parse()?;
     let since: Since = "2 weeks".parse().map_err(anyhow::Error::msg)?;
-    let plan = Plan::try_new(config, Some(since))?;
-    assert_eq!(plan.cycles.len(), 2);
+    assert_eq!(Plan::try_new(config, Some(since))?.cycles.len(), 2);
 
-    let output = env::temp_dir().join(format!("tapas-cycles-{}.sql", process::id()));
-    let rows = tapas::run(
-        plan,
-        &format!("{base}/tapas_cycles_source"),
-        4,
-        &Output::File(output.clone()),
+    let mut sample = sample(
+        &base,
+        "cycles",
+        (SCHEMA, SEED),
+        SAMPLERS,
+        Some("2 weeks"),
         // Tiny chunks, so each round's new values span several queries.
         Options {
             chunk_size: 2,
@@ -113,30 +86,18 @@ async fn extracts_cycles_until_they_stop_growing() -> Result<()> {
         },
     )
     .await?;
+    let connection = &mut sample.connection;
 
-    let sql = fs::read_to_string(&output)?;
-    fs::remove_file(&output)?;
-    connection
-        .query_drop(format!("USE tapas_cycles_target; {sql}"))
-        .await?;
+    assert_eq!(ids(connection, "employees").await?, [1, 2, 5, 10, 20, 40]);
+    assert_eq!(sample.rows["employees"], 6);
 
+    assert_eq!(ids(connection, "projects").await?, [3, 7, 12, 15]);
     assert_eq!(
-        ids(&mut connection, "employees").await?,
-        [1, 2, 5, 10, 20, 40]
-    );
-    assert_eq!(rows["employees"], 6);
-
-    assert_eq!(ids(&mut connection, "projects").await?, [3, 7, 12, 15]);
-    assert_eq!(
-        ids(&mut connection, "project_tasks").await?,
+        ids(connection, "project_tasks").await?,
         [31, 32, 33, 71, 72, 73, 121, 122, 123, 151, 152, 153]
     );
-    assert_eq!(rows["project_tasks"], 12, "each task written once");
-    assert_eq!(ids(&mut connection, "write_offs").await?, [1, 2]);
+    assert_eq!(sample.rows["project_tasks"], 12, "each task written once");
+    assert_eq!(ids(connection, "write_offs").await?, [1, 2]);
 
-    connection
-        .query_drop("DROP DATABASE tapas_cycles_source; DROP DATABASE tapas_cycles_target")
-        .await?;
-    connection.disconnect().await?;
-    Ok(())
+    sample.finish().await
 }

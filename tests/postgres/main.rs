@@ -1,6 +1,6 @@
 //! Runs tapas against a real Postgres server. Set TAPAS_TEST_POSTGRES_URL to a URL whose user can
 //! create databases (no database in the path), e.g. postgres://postgres:tapas@127.0.0.1:5499
-//! Without it, the tests are skipped.
+//! Without it the tests skip themselves, unless CI is set, where a missing URL is a failure.
 
 use std::collections::BTreeMap;
 use std::{env, fs, process};
@@ -70,6 +70,19 @@ samplers:
     of:
       user_id: users.id
 "#;
+
+const URL: &str = "TAPAS_TEST_POSTGRES_URL";
+
+/// The URL of the test server, or nothing when the tests should skip. A missing URL fails under
+/// CI, where skipping would hide a broken setup.
+fn url() -> Option<String> {
+    let url = env::var(URL).ok();
+    if url.is_none() {
+        assert!(env::var_os("CI").is_none(), "{URL} must be set in CI");
+        eprintln!("{URL} not set, skipping");
+    }
+    url
+}
 
 async fn connect(url: &str) -> Result<Client> {
     let (client, connection) = tokio_postgres::connect(url, NoTls)
@@ -173,8 +186,7 @@ async fn assert_references_hold(target: &Client) -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn extracts_a_sample_into_a_sql_file_that_loads_into_postgres() -> Result<()> {
-    let Ok(base) = env::var("TAPAS_TEST_POSTGRES_URL") else {
-        eprintln!("TAPAS_TEST_POSTGRES_URL not set, skipping");
+    let Some(base) = url() else {
         return Ok(());
     };
     let databases = ["tapas_pg_file_source", "tapas_pg_file_target"];
@@ -242,8 +254,7 @@ async fn extracts_a_sample_into_a_sql_file_that_loads_into_postgres() -> Result<
 
 #[tokio::test(flavor = "multi_thread")]
 async fn writes_straight_into_a_postgres_target() -> Result<()> {
-    let Ok(base) = env::var("TAPAS_TEST_POSTGRES_URL") else {
-        eprintln!("TAPAS_TEST_POSTGRES_URL not set, skipping");
+    let Some(base) = url() else {
         return Ok(());
     };
     let databases = ["tapas_pg_target_source", "tapas_pg_target_target"];
@@ -312,8 +323,7 @@ sanitize:
 
 #[tokio::test(flavor = "multi_thread")]
 async fn says_what_a_target_user_needs_to_skip_foreign_key_checks() -> Result<()> {
-    let Ok(base) = env::var("TAPAS_TEST_POSTGRES_URL") else {
-        eprintln!("TAPAS_TEST_POSTGRES_URL not set, skipping");
+    let Some(base) = url() else {
         return Ok(());
     };
     let databases = ["tapas_pg_role_source", "tapas_pg_role_target"];
@@ -368,8 +378,7 @@ async fn says_what_a_target_user_needs_to_skip_foreign_key_checks() -> Result<()
 
 #[tokio::test(flavor = "multi_thread")]
 async fn says_why_the_target_refused_a_statement() -> Result<()> {
-    let Ok(base) = env::var("TAPAS_TEST_POSTGRES_URL") else {
-        eprintln!("TAPAS_TEST_POSTGRES_URL not set, skipping");
+    let Some(base) = url() else {
         return Ok(());
     };
     let databases = ["tapas_pg_refused_source", "tapas_pg_refused_target"];
@@ -425,8 +434,7 @@ async fn says_why_the_target_refused_a_statement() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn debug_shows_the_row_the_target_refused() -> Result<()> {
-    let Ok(base) = env::var("TAPAS_TEST_POSTGRES_URL") else {
-        eprintln!("TAPAS_TEST_POSTGRES_URL not set, skipping");
+    let Some(base) = url() else {
         return Ok(());
     };
     let databases = ["tapas_pg_row_source", "tapas_pg_row_target"];
@@ -470,8 +478,7 @@ async fn debug_shows_the_row_the_target_refused() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn follows_references_over_several_columns() -> Result<()> {
-    let Ok(base) = env::var("TAPAS_TEST_POSTGRES_URL") else {
-        eprintln!("TAPAS_TEST_POSTGRES_URL not set, skipping");
+    let Some(base) = url() else {
         return Ok(());
     };
     // Every tenant has users 1 and 2, so a user's id alone doesn't say which user it is.
@@ -551,8 +558,7 @@ samplers:
 
 #[tokio::test(flavor = "multi_thread")]
 async fn follows_foreign_keys_in_postgres() -> Result<()> {
-    let Ok(base) = env::var("TAPAS_TEST_POSTGRES_URL") else {
-        eprintln!("TAPAS_TEST_POSTGRES_URL not set, skipping");
+    let Some(base) = url() else {
         return Ok(());
     };
     // Every tenant has users 1 and 2, and a manager is a user of the same tenant.
