@@ -17,6 +17,7 @@ tapas [OPTIONS] <CONFIGS>...
 | `--chunk-size <N>` | `5000` | Values per `IN (...)` list. |
 | `--batch-rows <N>` | `500` | Rows per `INSERT` statement. |
 | `--sanitize-seed <TEXT>` | | Makes fake values the same from run to run. |
+| `--debug` | | Shows the values in errors. |
 
 ## `--source`
 
@@ -112,6 +113,40 @@ Without it, each run picks its own seed. Within one run, fakes always line up.
 
 Treat the seed like a password, and keep it off the command line the same way: see
 [why](sanitization.md#consistent-fakes).
+
+## `--debug`
+
+Shows the values in errors. Without it, tapas keeps the sample's values out of its errors, so they're safe in CI logs:
+
+- A query the source fails shows each list of values as the column they come from, as `--plan` does:
+  ``running SELECT * FROM `phones` WHERE `user_id` IN (<users.id>)``.
+- A statement the target refuses shows only its table and columns:
+
+```
+Error: writing to the target
+
+Caused by:
+    0: running INSERT INTO `users` (`id`, `name`) VALUES …
+    1: Server error: `ERROR 1406 (22001): Data too long for column 'name' at row 3'
+```
+
+With `--debug`, a failed query shows its values. When the target refuses a statement, tapas runs its rows again one
+at a time, and shows the first one the target refuses, with the target's reason for it:
+
+```
+Caused by:
+    0: running INSERT INTO `users` (`id`, `name`) VALUES
+       (3, 'Maximiliana');
+    1: Server error: `ERROR 1406 (22001): Data too long for column 'name' at row 1'
+```
+
+If every row goes in on its own, as when two rows of the statement clash with each other, the error shows the whole
+statement instead. On Postgres, running the rows again takes a savepoint before each statement.
+
+The rows are as tapas writes them, so [sanitized](sanitization.md) columns hold their replacements.
+
+The database's own messages can quote a value with or without `--debug`, such as MySQL's
+`Duplicate entry '5' for key 'users.PRIMARY'` or Postgres's `Failing row contains (…)`.
 
 ## `--plan`
 

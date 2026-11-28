@@ -52,7 +52,7 @@ pub async fn run(
         }
     };
     let tables: Vec<&str> = plan.tables.keys().map(String::as_str).collect();
-    let (sink, sender) = Sink::open(output, dialect, &tables).await?;
+    let (sink, sender) = Sink::open(output, dialect, &tables, options.debug).await?;
     let extracted = extract::extract(plan, source.clone(), options, sanitizer, sender).await;
     let outcome = if extracted.is_ok() {
         Outcome::Keep

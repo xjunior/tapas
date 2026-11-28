@@ -292,6 +292,31 @@ impl Plan {
         Ok(())
     }
 
+    /// The SELECT that sampler `index` runs, without its LIMIT, with each list of values written
+    /// as the column they come from, as in `IN (<users.id>)`.
+    #[must_use]
+    pub fn query_outline(&self, index: usize, dialect: Dialect) -> Vec<u8> {
+        let sampler = &self.samplers[index];
+        let deps: Vec<Dep> = sampler
+            .of
+            .iter()
+            .map(|(column, parent)| {
+                let allowed = if self.allows_any(parent) {
+                    Allowed::AnyValue
+                } else {
+                    Allowed::Values(vec![format!("<{parent}>").into_bytes()])
+                };
+                Dep {
+                    column: column.clone(),
+                    allowed,
+                }
+            })
+            .collect();
+        // Every dep allows one placeholder value, so there's exactly one query.
+        let time_filter = self.time_filter(index, dialect);
+        sql::sampler_queries(dialect, sampler, time_filter.as_deref(), &deps, 1).remove(0)
+    }
+
     /// Returns what `--plan` prints: each table in run order, with the queries its samplers will
     /// run.
     #[must_use]
@@ -361,26 +386,7 @@ impl Plan {
 
             for &index in &table.samplers {
                 let sampler = &self.samplers[index];
-                let deps: Vec<Dep> = sampler
-                    .of
-                    .iter()
-                    .map(|(column, parent)| {
-                        let allowed = if self.allows_any(parent) {
-                            Allowed::AnyValue
-                        } else {
-                            Allowed::Values(vec![format!("<{parent}>").into_bytes()])
-                        };
-                        Dep {
-                            column: column.clone(),
-                            allowed,
-                        }
-                    })
-                    .collect();
-                // Every dep allows one placeholder value, so there's exactly one query.
-                let time_filter = self.time_filter(index, dialect);
-                let mut query =
-                    sql::sampler_queries(dialect, sampler, time_filter.as_deref(), &deps, 1)
-                        .remove(0);
+                let mut query = self.query_outline(index, dialect);
                 if let Some(limit) = sampler.limit {
                     query.extend_from_slice(format!(" LIMIT {limit}").as_bytes());
                 }
