@@ -12,8 +12,8 @@ This page is for people changing tapas.
 | `sql` | Builds the queries, the `INSERT`s and the file's first and last lines, and writes values as literals. What differs between databases lives in one place per dialect (`sql/mysql.rs`, `sql/postgres.rs`), behind the `Syntax` trait. |
 | `sanitize` | Works out what each table's sanitize rules do to its columns, and rewrites rows to match. |
 | `fake` | Makes fake values from a seed. |
-| `extract` | Runs the plan: schedules samplers, streams rows, and keeps the values children need. |
-| `source` | Opens the source's read-only connections, and reads the columns the sanitize rules cover and the foreign keys. |
+| `extract` | Runs the plan: schedules samplers, batches the rows a source streams, and keeps the values children need. It doesn't know which database it reads. |
+| `source` | Opens the source's read-only connections, streams a query's rows as SQL literals, and reads the columns the sanitize rules cover and the foreign keys. Each driver's way of reading lives here. |
 | `postgres` | Connects to Postgres, over TLS when the server offers it, and pools the source's connections. |
 | `output` | Writes the sample: a SQL file on its own thread, or a target database in one transaction. |
 | `run` | Picks MySQL or Postgres from the URLs, refuses a target of another kind, and wires the source, the plan, the extraction and the output together. |
