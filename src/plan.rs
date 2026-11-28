@@ -2,10 +2,11 @@
 //! each table's rows while extracting.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Display;
 
 use anyhow::{Result, bail};
 
-use crate::config::{ColumnRef, Config, Sampler, Sanitize};
+use crate::config::{ColumnRef, Columns, Config, Sampler, Sanitize};
 use crate::since::Since;
 use crate::sql::{self, Allowed, Dep, Dialect};
 
@@ -19,7 +20,7 @@ pub struct TablePlan {
     /// Tables that filter on this table's rows.
     pub children: BTreeSet<String>,
     /// Columns whose values children filter on, so they're kept while extracting.
-    pub keep: BTreeSet<String>,
+    pub keep: BTreeSet<Columns>,
     /// Some sampler keeps every row.
     pub full: bool,
     /// The same row can come back twice: the table has several samplers, or is in a cycle.
@@ -42,7 +43,7 @@ pub struct Plan {
     /// Index into `samplers` of each named sampler, by name.
     pub named: BTreeMap<String, usize>,
     /// Columns whose values children read from a named sampler's own rows.
-    pub named_keep: BTreeMap<String, BTreeSet<String>>,
+    pub named_keep: BTreeMap<String, BTreeSet<Columns>>,
     /// How far back samplers with a `limit.since` reach, when `--since` was given.
     pub since: Option<Since>,
     /// What to write in place of sensitive values.
@@ -86,28 +87,28 @@ impl Plan {
             named.insert(name.clone(), index);
         }
 
-        let mut named_keep: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut named_keep: BTreeMap<String, BTreeSet<Columns>> = BTreeMap::new();
         for sampler in &samplers {
-            for (column, parent) in &sampler.of {
+            for (columns, parent) in &sampler.of {
                 // A dep names a table, or a named sampler of one.
                 let parent_table = match named.get(&parent.table) {
                     Some(&index) => {
                         named_keep
                             .entry(parent.table.clone())
                             .or_default()
-                            .insert(parent.column.clone());
+                            .insert(parent.columns.clone());
                         samplers[index].table.clone()
                     }
                     None => {
                         let Some(parent_plan) = tables.get_mut(&parent.table) else {
                             bail!(
-                                "{}: {}.{column} depends on {parent}, but no sampler extracts {}",
+                                "{}: {}.{columns} depends on {parent}, but no sampler extracts {}",
                                 sampler.origin,
                                 sampler.table,
                                 parent.table
                             );
                         };
-                        parent_plan.keep.insert(parent.column.clone());
+                        parent_plan.keep.insert(parent.columns.clone());
                         parent.table.clone()
                     }
                 };
@@ -181,7 +182,7 @@ impl Plan {
     ///
     /// Panics if `index` isn't a sampler of this plan.
     #[must_use]
-    pub fn cycle_deps(&self, index: usize) -> Vec<&str> {
+    pub fn cycle_deps(&self, index: usize) -> Vec<&Columns> {
         let sampler = &self.samplers[index];
         let Some(cycle) = self.tables[&sampler.table].cycle else {
             return Vec::new();
@@ -193,7 +194,7 @@ impl Plan {
                 self.tables[self.parent_table(parent)].cycle == Some(cycle)
                     && !self.allows_any(parent)
             })
-            .map(|(column, _)| column.as_str())
+            .map(|(columns, _)| columns)
             .collect()
     }
 
@@ -229,14 +230,20 @@ impl Plan {
         let Some(plan) = self.tables.get(table) else {
             return columns;
         };
-        columns.extend(plan.keep.iter().map(String::as_str));
+        columns.extend(plan.keep.iter().flat_map(Columns::iter).map(String::as_str));
         for &index in &plan.samplers {
             let sampler = &self.samplers[index];
-            columns.extend(sampler.of.keys().map(String::as_str));
+            columns.extend(
+                sampler
+                    .of
+                    .keys()
+                    .flat_map(Columns::iter)
+                    .map(String::as_str),
+            );
             if let Some(name) = &sampler.name
                 && let Some(kept) = self.named_keep.get(name)
             {
-                columns.extend(kept.iter().map(String::as_str));
+                columns.extend(kept.iter().flat_map(Columns::iter).map(String::as_str));
             }
         }
         // `deps` belong to the table, even on a sampler that takes no rows and so never runs.
@@ -245,13 +252,19 @@ impl Plan {
             .iter()
             .filter(|sampler| sampler.table == table)
         {
-            columns.extend(sampler.deps.keys().map(String::as_str));
+            columns.extend(
+                sampler
+                    .deps
+                    .keys()
+                    .flat_map(Columns::iter)
+                    .map(String::as_str),
+            );
         }
         // A dep on a table that takes every row pulls nothing in, so it isn't in `keep`.
         for sampler in &self.samplers {
             for parent in sampler.deps.values() {
                 if parent.table == table {
-                    columns.insert(&parent.column);
+                    columns.extend(parent.columns.iter().map(String::as_str));
                 }
             }
         }
@@ -310,14 +323,14 @@ impl Plan {
         let deps: Vec<Dep> = sampler
             .of
             .iter()
-            .map(|(column, parent)| {
+            .map(|(columns, parent)| {
                 let allowed = if self.allows_any(parent) {
                     Allowed::AnyValue
                 } else {
                     Allowed::Values(vec![format!("<{parent}>").into_bytes()])
                 };
                 Dep {
-                    column: column.clone(),
+                    columns: columns.clone(),
                     allowed,
                 }
             })
@@ -435,9 +448,9 @@ fn pull_referenced_rows(samplers: &mut Vec<Sampler>, since: Option<Since>) -> Re
         .collect();
 
     // (child table, child column) -> (parent table, parent column), each once.
-    let mut edges: BTreeMap<(String, String), (ColumnRef, &str)> = BTreeMap::new();
+    let mut edges: BTreeMap<(String, Columns), (ColumnRef, &str)> = BTreeMap::new();
     for sampler in samplers.iter() {
-        for (column, parent) in &sampler.deps {
+        for (columns, parent) in &sampler.deps {
             if names.contains(parent.table.as_str()) {
                 bail!(
                     "{}: deps point at tables, but `{}` is a sampler name. Use `of` to follow a \
@@ -446,12 +459,12 @@ fn pull_referenced_rows(samplers: &mut Vec<Sampler>, since: Option<Since>) -> Re
                     parent.table
                 );
             }
-            let key = (sampler.table.clone(), column.clone());
+            let key = (sampler.table.clone(), columns.clone());
             if let Some((other, origin)) = edges.get(&key)
                 && other != parent
             {
                 bail!(
-                    "{}: {}.{column} points at {parent}, but {origin} says it points at {other}",
+                    "{}: {}.{columns} points at {parent}, but {origin} says it points at {other}",
                     sampler.origin,
                     sampler.table
                 );
@@ -463,10 +476,10 @@ fn pull_referenced_rows(samplers: &mut Vec<Sampler>, since: Option<Since>) -> Re
     let pulls: Vec<Sampler> = edges
         .into_iter()
         .filter(|(_, (parent, _))| !full.contains(parent.table.as_str()))
-        .map(|((table, column), (parent, _))| Sampler {
-            origin: format!("pulled in by {table}.{column}"),
+        .map(|((table, columns), (parent, _))| Sampler {
+            origin: format!("pulled in by {table}.{columns}"),
             table: parent.table,
-            of: BTreeMap::from([(parent.column, ColumnRef { table, column })]),
+            of: BTreeMap::from([(parent.columns, ColumnRef { table, columns })]),
             ..Sampler::default()
         })
         .collect();
@@ -481,8 +494,8 @@ fn keeps_every_row(sampler: &Sampler, since: Option<Since>) -> bool {
 }
 
 #[must_use]
-fn join(names: &BTreeSet<String>) -> String {
-    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+fn join<T: Display>(names: &BTreeSet<T>) -> String {
+    let names: Vec<String> = names.iter().map(ToString::to_string).collect();
     names.join(", ")
 }
 
@@ -775,11 +788,11 @@ samplers:
 
         assert_eq!(
             plan.tables["users"].keep,
-            BTreeSet::from(["id".to_string()])
+            BTreeSet::from([Columns::from("id")])
         );
         assert_eq!(
             plan.tables["orders"].keep,
-            BTreeSet::from(["id".to_string()])
+            BTreeSet::from([Columns::from("id")])
         );
         assert!(
             plan.tables["phones"].keep.is_empty(),
@@ -972,7 +985,11 @@ samplers:
             "project_tasks depends on projects in its cycle"
         );
         assert!(!plan.loops(4), "task_notes isn't in the cycle");
-        assert_eq!(plan.cycle_deps(5), ["id"], "users.id is outside the cycle");
+        assert_eq!(
+            plan.cycle_deps(5),
+            [&Columns::from("id")],
+            "users.id is outside the cycle"
+        );
         Ok(())
     }
 
@@ -1083,7 +1100,7 @@ samplers:
         assert_eq!(plan.named["recent_write_offs"], 1);
         assert_eq!(
             plan.named_keep["recent_write_offs"],
-            BTreeSet::from(["project_id".to_string()])
+            BTreeSet::from([Columns::from("project_id")])
         );
         assert!(
             plan.tables["written_off_projects"].keep.is_empty(),
@@ -1100,7 +1117,7 @@ samplers:
         );
 
         // The table keeps every row, but the named sampler doesn't, so its values matter.
-        let parent = &plan.samplers[2].of["id"];
+        let parent = &plan.samplers[2].of[&Columns::from("id")];
         assert_eq!(plan.parent_table(parent), "written_off_projects");
         assert!(
             !plan.allows_any(parent),
@@ -1118,7 +1135,7 @@ samplers:
     fn a_named_sampler_that_keeps_everything_allows_any_value() -> Result<()> {
         let plan = plan_since(WRITE_OFFS, "ever")?;
         assert!(
-            plan.allows_any(&plan.samplers[2].of["id"]),
+            plan.allows_any(&plan.samplers[2].of[&Columns::from("id")]),
             "--since ever makes recent_write_offs keep every row"
         );
         Ok(())
@@ -1174,7 +1191,10 @@ samplers:
             "deps don't narrow the users sampler"
         );
         assert_eq!(users[1].origin, "pulled in by orders.user_id");
-        assert_eq!(users[1].of["id"].to_string(), "orders.user_id");
+        assert_eq!(
+            users[1].of[&Columns::from("id")].to_string(),
+            "orders.user_id"
+        );
 
         // orders: only its time window; it runs before the users it points at.
         let orders_index = plan.tables["orders"].samplers[0];
@@ -1190,7 +1210,7 @@ samplers:
         );
         assert_eq!(
             plan.tables["orders"].keep,
-            BTreeSet::from(["user_id".to_string()])
+            BTreeSet::from([Columns::from("user_id")])
         );
         assert!(
             position(&plan, "orders")? < position(&plan, "users")?,

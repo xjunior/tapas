@@ -4,7 +4,7 @@ use std::fmt::{self, Display, Formatter};
 
 use mysql_async::consts::ColumnType;
 
-use crate::config::Sampler;
+use crate::config::{Columns, Sampler};
 
 /// The binary character set id, used by BLOB, BINARY and VARBINARY columns.
 const BINARY_CHARSET: u16 = 63;
@@ -289,11 +289,12 @@ pub enum Allowed {
     Values(Vec<Vec<u8>>),
 }
 
-/// A column of a sampler's table, and the values its parent allows in it.
+/// The columns of a sampler's table that point at a parent, and the values the parent allows in
+/// them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Dep {
-    /// The column of the sampler's table that points at the parent.
-    pub column: String,
+    /// The columns of the sampler's table that point at the parent.
+    pub columns: Columns,
     /// The values the column may hold.
     pub allowed: Allowed,
 }
@@ -316,7 +317,10 @@ pub fn sampler_queries(
 ) -> Vec<Vec<u8>> {
     let mut combinations: Vec<Vec<Vec<u8>>> = vec![Vec::new()];
 
-    for Dep { column, allowed } in deps {
+    for Dep { columns, allowed } in deps {
+        let column = columns
+            .single()
+            .expect("config only builds single-column references so far");
         match allowed {
             Allowed::AnyValue => {
                 let mut condition = Vec::with_capacity(column.len() + 14);
@@ -575,7 +579,7 @@ mod tests {
 
     fn dep(column: &str, allowed: Allowed) -> Dep {
         Dep {
-            column: column.to_string(),
+            columns: Columns::from(column),
             allowed,
         }
     }

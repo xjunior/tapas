@@ -13,6 +13,7 @@ use tokio::task::JoinSet;
 use tokio_postgres::SimpleQueryMessage;
 use xxhash_rust::xxh3;
 
+use crate::config::Columns;
 use crate::plan::Plan;
 use crate::postgres;
 use crate::sanitize::{Placed, Sanitizer, Scratch, Seed};
@@ -76,7 +77,7 @@ impl KeySet {
 #[derive(Debug, Clone, Default)]
 struct TableState {
     /// Literals of the values extracted so far, per kept column.
-    keys: BTreeMap<String, KeySet>,
+    keys: BTreeMap<Columns, KeySet>,
     /// Hashes of rows written so far, for tables with more than one sampler.
     seen: HashSet<u128>,
     rows: u64,
@@ -85,8 +86,8 @@ struct TableState {
 impl TableState {
     /// Starts with no rows, keeping the values of `columns`.
     #[must_use]
-    fn new_with_keys(columns: &BTreeSet<String>) -> Self {
-        let keys: BTreeMap<String, KeySet> = columns
+    fn new_with_keys(columns: &BTreeSet<Columns>) -> Self {
+        let keys: BTreeMap<Columns, KeySet> = columns
             .iter()
             .map(|column| (column.clone(), KeySet::default()))
             .collect();
@@ -366,11 +367,11 @@ fn current_deps(
     sampler
         .of
         .iter()
-        .map(|(column, parent)| {
-            let column = column.clone();
+        .map(|(columns, parent)| {
+            let columns = columns.clone();
             if plan.allows_any(parent) {
                 return Dep {
-                    column,
+                    columns,
                     allowed: Allowed::AnyValue,
                 };
             }
@@ -378,16 +379,16 @@ fn current_deps(
                 Some(named) => lock(named),
                 None => lock(&context.tables[&parent.table]),
             };
-            let keys = &state.keys[&parent.column];
+            let keys = &state.keys[&parent.columns];
             let from = match cursors.as_deref_mut() {
-                Some(cursors) if cycle_deps == [column.as_str()] => {
+                Some(cursors) if cycle_deps == [&columns] => {
                     let cursor = cursors.entry(index).or_insert(0);
                     mem::replace(cursor, keys.found())
                 }
                 _ => 0,
             };
             Dep {
-                column,
+                columns,
                 allowed: Allowed::Values(keys.values_from(from)),
             }
         })
@@ -649,7 +650,7 @@ impl<'query> Batcher<'query> {
 /// A column of a query's rows whose values are remembered.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct KeptColumn<'plan> {
-    name: &'plan str,
+    columns: &'plan Columns,
     /// Where the column sits in the query's rows.
     position: usize,
 }
@@ -670,19 +671,22 @@ struct Keep<'plan> {
 
 /// Finds where each of `columns` sits among a query's column `names`. Fails if `table` lacks one.
 fn kept_columns<'plan>(
-    columns: &'plan BTreeSet<String>,
+    kept_columns: &'plan BTreeSet<Columns>,
     names: &[String],
     table: &str,
 ) -> Result<Vec<KeptColumn<'plan>>> {
-    let mut kept = Vec::with_capacity(columns.len());
-    for name in columns {
+    let mut kept = Vec::with_capacity(kept_columns.len());
+    for columns in kept_columns {
+        let name = columns
+            .single()
+            .expect("config only builds single-column references so far");
         let position = names
             .iter()
             .position(|found| found == name)
             .ok_or_else(|| {
                 anyhow!("{table} has no column {name}, which another sampler depends on")
             })?;
-        kept.push(KeptColumn { name, position });
+        kept.push(KeptColumn { columns, position });
     }
     Ok(kept)
 }
@@ -704,7 +708,7 @@ async fn write_batch(
                 if row[column.position] != sql::NULL {
                     state
                         .keys
-                        .get_mut(column.name)
+                        .get_mut(column.columns)
                         .expect("a named sampler's state has a key set per kept column")
                         .insert(&row[column.position]);
                 }
@@ -724,7 +728,7 @@ async fn write_batch(
                 if row[column.position] != sql::NULL {
                     state
                         .keys
-                        .get_mut(column.name)
+                        .get_mut(column.columns)
                         .expect("a table's state has a key set per kept column")
                         .insert(&row[column.position]);
                 }

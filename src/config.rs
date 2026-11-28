@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt::{self, Display, Formatter};
 use std::fs;
 use std::path::PathBuf;
+use std::slice;
 use std::str::FromStr;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -339,12 +340,12 @@ pub struct Sampler {
     /// narrows it to the rows that belong to its parents.
     pub limit: Option<Limit>,
     /// `my_column: parent.column`: only rows that belong to the parent's extracted rows.
-    #[serde(default)]
-    pub of: BTreeMap<String, ColumnRef>,
+    #[serde(default, deserialize_with = "references")]
+    pub of: BTreeMap<Columns, ColumnRef>,
     /// `my_column: parent.column`: the parent rows this table's rows point at get extracted too.
     /// Applies to every row of the table, whichever sampler brought it in.
-    #[serde(default)]
-    pub deps: BTreeMap<String, ColumnRef>,
+    #[serde(default, deserialize_with = "references")]
+    pub deps: BTreeMap<Columns, ColumnRef>,
     /// Where the sampler was defined, for messages: `users.yml sampler #2 (users)`.
     #[serde(skip)]
     pub origin: String,
@@ -516,17 +517,86 @@ fn since_columns(value: Value) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
-/// A `table.column` reference to a parent's extracted rows.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(try_from = "String")]
+/// The columns on one side of a reference: one, or several for a composite key. The columns on
+/// the two sides pair up by position.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Columns(Vec<String>);
+
+impl Columns {
+    /// Wraps `columns`, which must not be empty.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `columns` is empty.
+    #[must_use]
+    pub fn new(columns: Vec<String>) -> Self {
+        assert!(
+            !columns.is_empty(),
+            "a reference follows at least one column"
+        );
+        Self(columns)
+    }
+
+    /// Returns the column when there is only one.
+    #[must_use]
+    pub fn single(&self) -> Option<&str> {
+        match self.0.as_slice() {
+            [column] => Some(column),
+            _ => None,
+        }
+    }
+
+    /// Returns the column names, in order.
+    #[must_use]
+    pub fn as_slice(&self) -> &[String] {
+        &self.0
+    }
+
+    /// Iterates over the column names, in order.
+    pub fn iter(&self) -> slice::Iter<'_, String> {
+        self.0.iter()
+    }
+}
+
+impl From<&str> for Columns {
+    fn from(column: &str) -> Self {
+        Self(vec![column.to_string()])
+    }
+}
+
+impl Display for Columns {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self.0.as_slice() {
+            [column] => f.write_str(column),
+            columns => write!(f, "({})", columns.join(", ")),
+        }
+    }
+}
+
+/// A parent's columns, and the table or named sampler whose extracted rows they read.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ColumnRef {
     /// The parent table, or the name of a sampler of it.
     pub table: String,
-    /// The parent's column.
-    pub column: String,
+    /// The parent's columns.
+    pub columns: Columns,
 }
 
-impl TryFrom<String> for ColumnRef {
+impl Display for ColumnRef {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}", self.table, self.columns)
+    }
+}
+
+/// A `table.column` as written in YAML.
+#[derive(Debug, Deserialize)]
+#[serde(try_from = "String")]
+struct Target {
+    table: String,
+    column: String,
+}
+
+impl TryFrom<String> for Target {
     type Error = String;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
@@ -544,10 +614,36 @@ impl TryFrom<String> for ColumnRef {
     }
 }
 
-impl Display for ColumnRef {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "{}.{}", self.table, self.column)
+/// Reads `of` or `deps`: a map of `my_column: table.column`.
+fn references<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<Columns, ColumnRef>, D::Error> {
+    struct Visitor;
+
+    impl<'de> de::Visitor<'de> for Visitor {
+        type Value = BTreeMap<Columns, ColumnRef>;
+
+        fn expecting(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            f.write_str("a map of `column: table.column`")
+        }
+
+        fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut found: BTreeMap<Columns, ColumnRef> = BTreeMap::new();
+            while let Some((column, target)) = map.next_entry::<String, Target>()? {
+                let columns = Columns::new(vec![column]);
+                let parent = ColumnRef {
+                    table: target.table,
+                    columns: Columns::new(vec![target.column]),
+                };
+                if found.insert(columns.clone(), parent).is_some() {
+                    return Err(de::Error::custom(format!("`{columns}` is listed twice")));
+                }
+            }
+            Ok(found)
+        }
     }
+
+    deserializer.deserialize_map(Visitor)
 }
 
 impl Config {
@@ -668,10 +764,10 @@ samplers:
         assert_eq!(users.order_by.as_deref(), Some("id DESC"));
         assert_eq!(users.limit, count(100));
         assert_eq!(
-            users.of["country_id"],
+            users.of[&Columns::from("country_id")],
             ColumnRef {
                 table: "countries".to_string(),
-                column: "id".to_string(),
+                columns: Columns::from("id"),
             }
         );
         assert!(!users.is_unfiltered(), "users has a filter: {users:?}");
