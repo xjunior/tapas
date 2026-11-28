@@ -7,7 +7,7 @@ This page is for people changing tapas.
 | Module | Role |
 | --- | --- |
 | `config` | Loads the YAML files, expands globs, and labels each sampler with where it came from. |
-| `since` | Parses `--since` and turns a `time_column` into a SQL condition. |
+| `since` | Parses `--since` and turns a `limit`'s `since` into a SQL condition. |
 | `plan` | Validates the samplers, turns `deps` into samplers, finds cycles, and orders the tables. |
 | `sql` | Builds the queries, the `INSERT`s and the file's first and last lines, and writes values as literals, in MySQL's or Postgres's SQL. |
 | `sanitize` | Works out what each table's sanitize rules do to its columns, and rewrites rows to match. |
@@ -20,8 +20,9 @@ This page is for people changing tapas.
 
 ## From config to plan
 
-1. `--since` stays in the plan; the configured samplers aren't changed. A sampler with a `time_column` gets the
-   condition when its queries are built, and doesn't count as taking every row when `--since` is a span.
+1. `--since` stays in the plan; the configured samplers aren't changed. A sampler whose `limit` has a `since` gets
+   the condition when its queries are built, and doesn't count as taking every row when `--since` is a span. A
+   sampler with no `limit` and no `of` takes no rows, so it never runs; its `deps` still count.
 2. Each `deps` reference, `table.column → parent.column`, becomes one extra sampler on the parent:
    `of: { parent.column: table.column }`. A parent that already takes every row gets none.
 3. Each `of` adds an edge from the parent table to the child. A named sampler stands for its table.
@@ -35,11 +36,11 @@ A table is **full** when one of its samplers takes every row. An `of` on a full 
 ## Running
 
 - A sampler outside a cycle starts as soon as every table it follows is done. A table is done when all its samplers
-  are.
+  are, and a table with none is done from the start.
 - A cycle starts as one unit once every table outside it that it follows is done.
 - Within a sampler, long value lists are split into chunks of `--chunk-size`. Several `of` lists become every
   combination of their chunks, so no row comes back from two queries.
-- Chunks run in parallel, except for a sampler with a `limit`, which runs them one after another until it has enough.
+- Chunks run in parallel, except for a sampler with a row cap (`limit: 100`), which runs them one after another until it has enough.
 - Rows stream into batches. A batch drops rows the table already has, keeps the values children need, replaces
   sanitized values, and goes to the writer as one `INSERT`.
 

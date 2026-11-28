@@ -7,7 +7,7 @@ built from the row's other columns.
 ```yaml
 samplers:
   - table: orders
-    time_column: created_at
+    limit: { since: created_at }
     deps:
       user_id: users.id
 
@@ -115,6 +115,7 @@ Each file can have its own `sanitize:`, so a component's `tapas.yml` sanitizes t
 # components/payroll/tapas.yml
 samplers:
   - table: payroll_runs
+    limit: all
     deps:
       employee_id: employees.id
 sanitize:

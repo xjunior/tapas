@@ -43,7 +43,7 @@ pub struct Plan {
     pub named: BTreeMap<String, usize>,
     /// Columns whose values children read from a named sampler's own rows.
     pub named_keep: BTreeMap<String, BTreeSet<String>>,
-    /// How far back samplers with a `time_column` reach, when `--since` was given.
+    /// How far back samplers with a `limit.since` reach, when `--since` was given.
     pub since: Option<Since>,
     /// What to write in place of sensitive values.
     pub sanitize: Sanitize,
@@ -63,7 +63,10 @@ impl Plan {
 
         for (index, sampler) in samplers.iter().enumerate() {
             let table = tables.entry(sampler.table.clone()).or_default();
-            table.samplers.push(index);
+            // A sampler that takes no rows only declares `deps`, so it never runs.
+            if sampler.takes_rows() {
+                table.samplers.push(index);
+            }
             table.full |= keeps_every_row(sampler, since);
         }
 
@@ -157,11 +160,11 @@ impl Plan {
         };
         for (index, sampler) in plan.samplers.iter().enumerate() {
             if let Some(cycle) = plan.tables[&sampler.table].cycle
-                && sampler.limit.is_some()
+                && sampler.row_cap().is_some()
                 && plan.loops(index)
             {
                 bail!(
-                    "{}: limit can't be used on a sampler that depends on its own cycle ({}), \
+                    "{}: a row limit can't be used on a sampler that depends on its own cycle ({}), \
                      because it runs in rounds",
                     sampler.origin,
                     plan.cycles[cycle].join(", ")
@@ -230,12 +233,19 @@ impl Plan {
         for &index in &plan.samplers {
             let sampler = &self.samplers[index];
             columns.extend(sampler.of.keys().map(String::as_str));
-            columns.extend(sampler.deps.keys().map(String::as_str));
             if let Some(name) = &sampler.name
                 && let Some(kept) = self.named_keep.get(name)
             {
                 columns.extend(kept.iter().map(String::as_str));
             }
+        }
+        // `deps` belong to the table, even on a sampler that takes no rows and so never runs.
+        for sampler in self
+            .samplers
+            .iter()
+            .filter(|sampler| sampler.table == table)
+        {
+            columns.extend(sampler.deps.keys().map(String::as_str));
         }
         // A dep on a table that takes every row pulls nothing in, so it isn't in `keep`.
         for sampler in &self.samplers {
@@ -248,7 +258,7 @@ impl Plan {
         columns
     }
 
-    /// Returns the `--since` condition on sampler `index`'s `time_column`, if it has one.
+    /// Returns the `--since` condition on sampler `index`'s `limit.since`, if it has one.
     ///
     /// # Panics
     ///
@@ -256,7 +266,7 @@ impl Plan {
     #[must_use]
     pub fn time_filter(&self, index: usize, dialect: Dialect) -> Option<String> {
         self.since?
-            .condition(dialect, &self.samplers[index].time_column)
+            .condition(dialect, self.samplers[index].since_columns())
     }
 
     /// Returns whether sampler `index` runs in rounds until its cycle stops growing.
@@ -269,9 +279,9 @@ impl Plan {
         !self.cycle_deps(index).is_empty()
     }
 
-    /// Fails unless `--since` was given or no sampler has a `time_column`. Samplers with a
-    /// `time_column` only run once `--since` says how far back to go, so a forgotten flag can't
-    /// quietly copy whole tables.
+    /// Fails unless `--since` was given or no sampler has a `limit.since`. Samplers with a
+    /// `since` only run once `--since` says how far back to go, so a forgotten flag can't quietly
+    /// copy whole tables.
     pub fn check_since(&self) -> Result<()> {
         if self.since.is_some() {
             return Ok(());
@@ -279,12 +289,12 @@ impl Plan {
         let timed: Vec<&str> = self
             .samplers
             .iter()
-            .filter(|sampler| !sampler.time_column.is_empty())
+            .filter(|sampler| !sampler.since_columns().is_empty())
             .map(|sampler| sampler.origin.as_str())
             .collect();
         if let Some(first) = timed.first() {
             bail!(
-                "{} sampler(s) have a time_column, starting with {first}. Pass --since, such as \
+                "{} sampler(s) have a limit with since, starting with {first}. Pass --since, such as \
                  --since '2 weeks', or --since ever to keep every row",
                 timed.len()
             );
@@ -324,25 +334,25 @@ impl Plan {
         let timed = self
             .samplers
             .iter()
-            .filter(|sampler| !sampler.time_column.is_empty())
+            .filter(|sampler| !sampler.since_columns().is_empty())
             .count();
         let limited = self
             .samplers
             .iter()
             .filter(|sampler| {
                 self.since
-                    .is_some_and(|since| since.narrows(&sampler.time_column))
+                    .is_some_and(|since| since.narrows(sampler.since_columns()))
             })
             .count();
         let mut out = format!(
-            "{} tables, {} samplers, {timed} with a time_column\n",
+            "{} tables, {} samplers, {timed} with a since\n",
             self.tables.len(),
             self.samplers.len()
         );
         let since_line: String = match self.since {
             None if timed > 0 => "--since: not given, so a run would refuse to start\n".to_string(),
             None => "--since: not needed\n".to_string(),
-            Some(Since::Ever) => "--since ever: time_column ignored, every row kept\n".to_string(),
+            Some(Since::Ever) => "--since ever: limit since ignored, every row kept\n".to_string(),
             Some(since @ Since::Back { .. }) => {
                 format!("--since {since}: limits {limited} samplers\n")
             }
@@ -371,6 +381,9 @@ impl Plan {
             if table.full {
                 notes.push("every row".to_string());
             }
+            if table.samplers.is_empty() {
+                notes.push("no rows".to_string());
+            }
             if let Some(rules) = self.sanitize.tables.get(name) {
                 let rules: Vec<String> = rules
                     .iter()
@@ -387,7 +400,7 @@ impl Plan {
             for &index in &table.samplers {
                 let sampler = &self.samplers[index];
                 let mut query = self.query_outline(index, dialect);
-                if let Some(limit) = sampler.limit {
+                if let Some(limit) = sampler.row_cap() {
                     query.extend_from_slice(format!(" LIMIT {limit}").as_bytes());
                 }
                 let rounds = if self.loops(index) {
@@ -464,7 +477,7 @@ fn pull_referenced_rows(samplers: &mut Vec<Sampler>, since: Option<Since>) -> Re
 /// Returns whether `sampler` keeps every row of its table once `since` applies.
 #[must_use]
 fn keeps_every_row(sampler: &Sampler, since: Option<Since>) -> bool {
-    sampler.is_unfiltered() && !since.is_some_and(|since| since.narrows(&sampler.time_column))
+    sampler.is_unfiltered() && !since.is_some_and(|since| since.narrows(sampler.since_columns()))
 }
 
 #[must_use]
@@ -585,18 +598,19 @@ mod tests {
     const TIMED: &str = r#"
 samplers:
   - table: countries
+    limit: all
   - table: users
-    time_column: [created_at, updated_at]
+    limit: { since: [created_at, updated_at] }
     of:
       country_id: countries.id
   - table: orders
-    time_column: created_at
+    limit: { since: created_at }
     of:
       user_id: users.id
 "#;
 
     #[test]
-    fn applies_since_to_samplers_with_a_time_column() -> Result<()> {
+    fn applies_since_to_samplers_with_a_since_limit() -> Result<()> {
         let plan = plan_since(TIMED, "2 weeks")?;
         assert_eq!(plan.time_filter(0, Dialect::MySql), None);
         assert_eq!(
@@ -626,7 +640,7 @@ samplers:
 
     #[test]
     fn a_time_limited_table_is_not_full() -> Result<()> {
-        let yaml = "samplers:\n  - table: events\n    time_column: created_at\n";
+        let yaml = "samplers:\n  - table: events\n    limit: { since: created_at }\n";
         assert!(
             !plan_since(yaml, "1 week")?.tables["events"].full,
             "--since 1 week drops older events"
@@ -652,12 +666,15 @@ samplers:
     }
 
     #[test]
-    fn requires_since_when_a_sampler_has_a_time_column() -> Result<()> {
+    fn requires_since_when_a_sampler_has_a_since_limit() -> Result<()> {
         let error = plan(TIMED)?
             .check_since()
             .expect_err("TIMED has time columns and no --since")
             .to_string();
-        assert!(error.contains("2 sampler(s) have a time_column"), "{error}");
+        assert!(
+            error.contains("2 sampler(s) have a limit with since"),
+            "{error}"
+        );
         assert!(error.contains("config sampler #2 (users)"), "{error}");
         assert!(error.contains("--since ever"), "{error}");
 
@@ -668,7 +685,7 @@ samplers:
     fn describes_the_plan() -> Result<()> {
         let described = plan_since(TIMED, "2 weeks")?.describe(Dialect::MySql);
         assert!(
-            described.contains("3 tables, 3 samplers, 2 with a time_column"),
+            described.contains("3 tables, 3 samplers, 2 with a since"),
             "{described}"
         );
         assert!(
@@ -712,12 +729,14 @@ samplers:
     const SHOP: &str = r#"
 samplers:
   - table: countries
+    limit: all
   - table: users
     order_by: id DESC
     limit: 100
     of:
       country_id: countries.id
   - table: users
+    limit: all
     where: admin = 1
   - table: phones
     of:
@@ -794,16 +813,20 @@ samplers:
             r#"
 samplers:
   - table: written_off_projects
+    limit: all
     name: recent_write_offs
     where: created_at > '2024-01-01'
   - table: projects
     of:
       id: recent_write_offs.project_id
   - table: orders
+    limit: all
     deps:
       user_id: users.id
   - table: countries
+    limit: all
   - table: addresses
+    limit: all
     deps:
       country_code: countries.code
 "#,
@@ -829,7 +852,7 @@ samplers:
     #[test]
     fn rejects_sanitize_rules_for_tables_nothing_extracts() {
         let error = plan(
-            "samplers:\n  - table: users\nsanitize:\n  tables:\n    user:\n      email: null\n",
+            "samplers:\n  - table: users\n    limit: all\nsanitize:\n  tables:\n    user:\n      email: null\n",
         )
         .expect_err("no sampler extracts `user`");
         assert_eq!(
@@ -844,7 +867,9 @@ samplers:
             r#"
 samplers:
   - table: users
+    limit: all
   - table: orders
+    limit: all
 sanitize:
   columns:
     "*email*": { fake: email }
@@ -889,8 +914,9 @@ sanitize:
     const PROJECTS: &str = r#"
 samplers:
   - table: users
+    limit: all
   - table: project_tasks
-    time_column: updated_at
+    limit: { since: updated_at }
   - table: projects
     of:
       id: project_tasks.project_id
@@ -990,6 +1016,7 @@ samplers:
             r#"
 samplers:
   - table: categories
+    limit: all
   - table: categories
     of:
       parent_id: categories.id
@@ -1017,7 +1044,10 @@ samplers:
 "#,
         )
         .expect_err("the second sampler loops and has a limit");
-        assert!(error.to_string().contains("limit can't be used"), "{error}");
+        assert!(
+            error.to_string().contains("a row limit can't be used"),
+            "{error}"
+        );
         assert!(error.to_string().contains("sampler #2"), "{error}");
     }
 
@@ -1038,9 +1068,10 @@ samplers:
     const WRITE_OFFS: &str = r#"
 samplers:
   - table: written_off_projects
+    limit: all
   - table: written_off_projects
     name: recent_write_offs
-    time_column: updated_at
+    limit: { since: updated_at }
   - table: projects
     of:
       id: recent_write_offs.project_id
@@ -1095,13 +1126,13 @@ samplers:
 
     #[test]
     fn rejects_bad_names() {
-        let clash = "samplers:\n  - table: users\n  - table: orders\n    name: users\n";
+        let clash = "samplers:\n  - table: users\n    limit: all\n  - table: orders\n    limit: all\n    name: users\n";
         let error = plan(clash)
             .expect_err("a sampler can't be named after a table")
             .to_string();
         assert!(error.contains("name `users` is also a table"), "{error}");
 
-        let twice = "samplers:\n  - table: users\n    name: a\n  - table: orders\n    name: a\n";
+        let twice = "samplers:\n  - table: users\n    limit: all\n    name: a\n  - table: orders\n    limit: all\n    name: a\n";
         let error = plan(twice)
             .expect_err("two samplers can't share a name")
             .to_string();
@@ -1112,6 +1143,7 @@ samplers:
     const REFERENCES: &str = r#"
 samplers:
   - table: users
+    limit: all
     deps:
       territory_id: territories.id
     where: age > 25
@@ -1119,9 +1151,10 @@ samplers:
   - table: orders
     deps:
       user_id: users.id
-    time_column: created_at
+    limit: { since: created_at }
 
   - table: territories
+    limit: all
 "#;
 
     #[test]
@@ -1153,7 +1186,7 @@ samplers:
         );
         assert!(
             plan.time_filter(orders_index, Dialect::MySql).is_some(),
-            "orders has a time_column and --since is given"
+            "orders has a since and --since is given"
         );
         assert_eq!(
             plan.tables["orders"].keep,
@@ -1178,7 +1211,7 @@ samplers:
     #[test]
     fn a_referenced_table_needs_no_sampler_of_its_own() -> Result<()> {
         let plan = plan_since(
-            "samplers:\n  - table: orders\n    time_column: created_at\n    deps:\n      user_id: users.id\n",
+            "samplers:\n  - table: orders\n    limit: { since: created_at }\n    deps:\n      user_id: users.id\n",
             "1 week",
         )?;
         assert_eq!(plan.tables["users"].samplers.len(), 1);
@@ -1189,10 +1222,116 @@ samplers:
         Ok(())
     }
 
+    const INVOICES: &str = r#"
+samplers:
+  - table: invoices
+    deps:
+      customer_id: customers.id
+  - table: orders
+    limit: all
+    deps:
+      invoice_id: invoices.id
+"#;
+
+    #[test]
+    fn a_sampler_with_only_deps_takes_no_rows_but_its_deps_still_pull() -> Result<()> {
+        let plan = plan(INVOICES)?;
+
+        // Orders pull the invoices they point at; the declared invoices sampler never runs.
+        assert_eq!(
+            plan.tables["invoices"].samplers.len(),
+            1,
+            "only the sampler pulled in by orders.invoice_id runs"
+        );
+        let pulled = &plan.samplers[plan.tables["invoices"].samplers[0]];
+        assert_eq!(pulled.origin, "pulled in by orders.invoice_id");
+        assert!(
+            !plan.tables["invoices"].full,
+            "invoices keeps no rows of its own"
+        );
+        // Those invoices bring their customers.
+        assert_eq!(plan.tables["customers"].samplers.len(), 1);
+        assert_eq!(
+            plan.samplers[plan.tables["customers"].samplers[0]].origin,
+            "pulled in by invoices.customer_id"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_table_with_only_a_deps_sampler_has_no_rows() -> Result<()> {
+        let plan =
+            plan("samplers:\n  - table: invoices\n    deps:\n      customer_id: customers.id\n")?;
+
+        assert!(
+            plan.tables["invoices"].samplers.is_empty(),
+            "nothing runs for invoices: {:?}",
+            plan.tables["invoices"]
+        );
+        assert!(!plan.tables["invoices"].full);
+        let described = plan.describe(Dialect::MySql);
+        assert!(
+            described.contains("invoices  (keeps customer_id; no rows)"),
+            "{described}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn deps_of_a_sampler_that_takes_no_rows_are_references() -> Result<()> {
+        let plan =
+            plan("samplers:\n  - table: invoices\n    deps:\n      customer_id: customers.id\n")?;
+
+        assert_eq!(
+            plan.references("invoices"),
+            BTreeSet::from(["customer_id"]),
+            "sanitizing customer_id would break the reference"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_row_cap_and_since_combine_into_one_query() -> Result<()> {
+        let plan = plan_since(
+            "samplers:\n  - table: events\n    order_by: id DESC\n    limit:\n      rows: 100\n      since: created_at\n",
+            "2 weeks",
+        )?;
+
+        let described = plan.describe(Dialect::MySql);
+        assert!(
+            described.contains(
+                "SELECT * FROM `events` WHERE `created_at` >= CURDATE() - INTERVAL 2 WEEK \
+                 ORDER BY id DESC LIMIT 100"
+            ),
+            "{described}"
+        );
+        assert!(!plan.tables["events"].full);
+        Ok(())
+    }
+
+    #[test]
+    fn since_limits_are_fine_in_a_cycle_but_row_caps_are_not() -> Result<()> {
+        let cycle = |limit: &str| {
+            plan(&format!(
+                "samplers:\n  - table: employees\n    where: id = 40\n    limit: all\n  - table: employees\n    limit: {limit}\n    of:\n      id: employees.manager_id\n"
+            ))
+        };
+
+        let planned = cycle("{ since: updated_at }")?;
+        assert!(planned.loops(1), "the second sampler runs in rounds");
+        let error = cycle("{ rows: 5, since: updated_at }")
+            .expect_err("a row cap can't hold across rounds");
+        assert!(
+            error.to_string().contains("a row limit can't be used"),
+            "{error}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn deps_on_a_table_that_points_at_itself_form_a_cycle() -> Result<()> {
         let plan = plan(
-            "samplers:\n  - table: employees\n    where: id = 40\n    deps:\n      manager_id: employees.id\n",
+            "samplers:\n  - table: employees\n    limit: all\n    where: id = 40\n    deps:\n      manager_id: employees.id\n",
         )?;
         assert_eq!(plan.cycles, [["employees"]]);
         assert!(
@@ -1204,13 +1343,13 @@ samplers:
 
     #[test]
     fn rejects_deps_on_sampler_names_and_conflicting_deps() {
-        let named = "samplers:\n  - table: users\n    name: adults\n  - table: orders\n    deps:\n      user_id: adults.id\n";
+        let named = "samplers:\n  - table: users\n    limit: all\n    name: adults\n  - table: orders\n    limit: all\n    deps:\n      user_id: adults.id\n";
         let error = plan(named)
             .expect_err("deps can't point at a sampler name")
             .to_string();
         assert!(error.contains("Use `of`"), "{error}");
 
-        let conflict = "samplers:\n  - table: orders\n    deps:\n      user_id: users.id\n  - table: orders\n    where: total > 0\n    deps:\n      user_id: people.id\n";
+        let conflict = "samplers:\n  - table: orders\n    limit: all\n    deps:\n      user_id: users.id\n  - table: orders\n    limit: all\n    where: total > 0\n    deps:\n      user_id: people.id\n";
         let error = plan(conflict)
             .expect_err("orders.user_id can't point at two tables")
             .to_string();

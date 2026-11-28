@@ -57,6 +57,7 @@ async fn shows_the_values_of_a_failed_query_only_with_debug() -> Result<()> {
     let samplers = "
 samplers:
   - table: users
+    limit: all
     where: id < 3
   - table: phones
     where: nope = 1
@@ -101,6 +102,7 @@ async fn names_the_query_that_failed_partway_through() -> Result<()> {
     let samplers = "
 samplers:
   - table: users
+    limit: all
     where: EXP(IF(id = 2, 1000, 0)) > 0
 ";
 

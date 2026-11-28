@@ -57,14 +57,16 @@ INSERT INTO orders (user_id, total, placed_at)
 const SAMPLERS: &str = r#"
 samplers:
   - table: countries
+    limit: all
 
   - table: users
+    limit: all
     where: id > 290
     deps:
       manager_id: users.id
 
   - table: orders
-    time_column: placed_at
+    limit: { since: placed_at }
     of:
       user_id: users.id
 "#;
@@ -378,7 +380,7 @@ async fn says_why_the_target_refused_a_statement() -> Result<()> {
         .await?
         .batch_execute("ALTER TABLE orders DROP COLUMN total")
         .await?;
-    let config: Config = "samplers:\n  - table: orders\n".parse()?;
+    let config: Config = "samplers:\n  - table: orders\n    limit: all\n".parse()?;
     let plan = Plan::try_new(config, None)?;
     let source_url = format!("{base}/{}", databases[0]);
     let target = Output::Database(format!("{base}/{}", databases[1]));
@@ -434,7 +436,7 @@ async fn debug_shows_the_row_the_target_refused() -> Result<()> {
         .await?
         .batch_execute("ALTER TABLE orders ADD CONSTRAINT small CHECK (total < 28)")
         .await?;
-    let config: Config = "samplers:\n  - table: orders\n".parse()?;
+    let config: Config = "samplers:\n  - table: orders\n    limit: all\n".parse()?;
 
     let error = tapas::run(
         Plan::try_new(config, None)?,

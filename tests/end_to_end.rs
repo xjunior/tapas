@@ -54,6 +54,7 @@ INSERT INTO events
 const SAMPLERS: &str = r#"
 samplers:
   - table: countries
+    limit: all
 
   - table: users
     order_by: id DESC
@@ -62,6 +63,7 @@ samplers:
       country_id: countries.id
 
   - table: users
+    limit: all
     where: admin = 1
 
   - table: phones
@@ -83,7 +85,7 @@ samplers:
       order_id: orders.id
 
   - table: events
-    time_column: [created_at, updated_at]
+    limit: { since: [created_at, updated_at] }
 "#;
 
 async fn scalar(connection: &mut Conn, query: &str) -> Result<u64> {

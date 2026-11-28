@@ -40,15 +40,17 @@ Describe the sample:
 ```yaml
 # tapas.yml
 samplers:
-  - table: countries              # every country
+  - table: countries
+    limit: all                    # every country
 
   - table: orders
-    time_column: created_at       # orders placed within --since
+    limit: { since: created_at }  # orders placed within --since
     deps:
       user_id: users.id           # plus the users who placed them
 
   - table: users
-    where: admin = 1              # plus every admin
+    where: admin = 1
+    limit: all                    # plus every admin
     deps:
       country_id: countries.id    # each user brings their country
 

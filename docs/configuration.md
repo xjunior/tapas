@@ -1,12 +1,17 @@
 # Configuration
 
-A config is a YAML file with a list of samplers. Each sampler picks rows from one table.
+A config is a YAML file with a list of samplers. Each sampler picks rows from one table, and its `limit` says how far
+it reaches.
 
 ```yaml
 samplers:
   - table: users
     where: activated_at IS NOT NULL
+    limit: all
 ```
+
+A table with no sampler, or a sampler with no `limit` and no `of`, brings no rows of its own. It is extracted only
+when another table's [`deps`](#of-and-deps) point at it.
 
 A config can also say how to replace sensitive values, under `sanitize:`. See [Sanitization](sanitization.md).
 
@@ -27,11 +32,10 @@ typo like `limt: 100` never goes unnoticed.
 
 | Key | Meaning |
 | --- | --- |
-| `table` | The table to read. A sampler with nothing else takes every row. |
-| `where` | A plain SQL condition, such as `created_at >= NOW() - INTERVAL 6 MONTH`, in the source's SQL. |
-| `order_by` | Plain SQL, such as `id DESC`, in the source's SQL. Mostly useful with `limit`. |
-| `limit` | The most rows this sampler takes. |
-| `time_column` | A column, or a list of them, that `--since` filters on. |
+| `table` | The table to read. |
+| `limit` | How far the sampler reaches: `all`, a row count, or `since`. See [Limits](#limits). |
+| `where` | A plain SQL condition, such as `state <> 'draft'`, in the source's SQL. Needs a `limit` or `of`. |
+| `order_by` | Plain SQL, such as `id DESC`, in the source's SQL. Mostly useful with a row count. Needs a `limit` or `of`. |
 | `of` | `my_column: table.column`. Only rows that belong to rows already in the sample. |
 | `deps` | `my_column: table.column`. The rows this table points at come along. |
 | `name` | Lets an `of` follow just this sampler's rows. |
@@ -43,8 +47,37 @@ A table gets every row any of its samplers picks, each row once. Add as many sam
   order_by: id DESC
   limit: 100                      # the 100 newest users...
 - table: users
-  where: admin = 1                # ...and every admin
+  where: admin = 1
+  limit: all                      # ...and every admin
 ```
+
+## Limits
+
+`limit` takes one of these:
+
+| Write | Rows taken |
+| --- | --- |
+| `limit: all` | Every row that matches `where`. |
+| `limit: 100` | At most 100, after `where` and `order_by`. |
+| `limit: { since: created_at }` | Rows whose `created_at` is within `--since`. |
+| `limit: { rows: 100, since: created_at }` | At most 100 of those, after `order_by`. |
+
+`limit: 100` is short for `limit: { rows: 100 }`, and `limit: all` for `limit: { rows: all }`. In the map, `rows`
+defaults to `all`, and `since` takes one column or a list. A row matches when any listed column is recent enough.
+
+```yaml
+- table: events
+  order_by: id DESC
+  limit: { rows: 1000, since: created_at }   # the 1000 newest events inside --since
+```
+
+A sampler with no `limit` takes no rows of its own. With `of` it takes the rows that belong to its parents; with only
+`deps` it brings no rows, and just says what its rows point at. Each of these is an error, since it can't pick a row:
+
+- a sampler with only `table`: write `limit: all` to copy the whole table;
+- a sampler with `where` or `order_by` but no `limit` or `of`.
+
+The old `time_column: created_at` is `limit: { since: created_at }` now.
 
 ## `of` and `deps`
 
@@ -64,7 +97,7 @@ With several entries, a row must match all of them.
 
 ```yaml
 - table: orders
-  time_column: created_at
+  limit: { since: created_at }
   deps:
     user_id: users.id
 ```
@@ -76,7 +109,8 @@ A few things follow from that:
 
 - A table reached only through `deps` needs no sampler of its own.
 - A table that already takes every row isn't pulled again.
-- A sampler with only `deps` still takes every row of its table, since `deps` never narrows.
+- A sampler with only `deps` takes no rows. The table's rows come only from its other samplers and from `deps` that
+  point at it.
 
 | You want | Write |
 | --- | --- |
@@ -85,20 +119,20 @@ A few things follow from that:
 
 ## Time windows
 
-`time_column` marks the samplers that `--since` sizes:
+`since` in a `limit` marks the samplers that `--since` sizes:
 
 ```yaml
 - table: projects
-  time_column: [created_at, updated_at]   # created or updated within --since
+  limit:
+    since: [created_at, updated_at]       # created or updated within --since
 - table: project_tasks
   of:
     project_id: projects.id               # follows its projects, no window of its own
 ```
 
-With a list, a row matches when any of the columns is recent enough. Put `time_column` on the tables the sample
-starts from, and let `of` and `deps` carry the window to the rest.
+Put `since` on the tables the sample starts from, and let `of` and `deps` carry the window to the rest.
 
-As soon as any sampler has a `time_column`, every run needs `--since`. See [Command line](cli.md#--since).
+As soon as any sampler has a `since`, every run needs `--since`. See [Command line](cli.md#--since).
 
 ## Following one sampler
 
@@ -107,9 +141,11 @@ follow it with `of`:
 
 ```yaml
 - table: written_off_projects             # every write-off
+  limit: all
 - table: written_off_projects
   name: recent_write_offs
-  time_column: [created_at, updated_at]
+  limit:
+    since: [created_at, updated_at]
 - table: projects
   of:
     id: recent_write_offs.project_id      # but only recent ones bring their project
@@ -125,12 +161,13 @@ Tables can lead to each other, or to themselves:
 # An employee, their manager, their manager's manager, ...
 - table: employees
   where: id = 40
+  limit: all
   deps:
     manager_id: employees.id
 
 # The projects of recent tasks, and every task of those projects.
 - table: project_tasks
-  time_column: updated_at
+  limit: { since: updated_at }
   deps:
     project_id: projects.id
 - table: project_tasks
@@ -138,12 +175,13 @@ Tables can lead to each other, or to themselves:
     project_id: projects.id
 ```
 
-tapas extracts a cycle in rounds until a round finds nothing new. A sampler that runs in rounds can't have a `limit`.
+tapas extracts a cycle in rounds until a round finds nothing new. A sampler that runs in rounds can't cap its rows:
+`limit: all` and `since` work, `limit: 100` doesn't.
 `--plan` shows each cycle and marks the samplers that run in rounds.
 
 ## Writing good samplers
 
-- Start from the tables your sample is about, give them a `time_column`, and follow references from there.
+- Start from the tables your sample is about, give them a `limit` with `since`, and follow references from there.
 - Prefer `of` and `deps` to subqueries in `where`. They keep every reference intact, and tapas can run them in
   parallel.
 - Keep `where` for conditions on the table's own columns, such as `state NOT IN ('draft')`.
