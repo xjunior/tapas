@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt::{self, Display, Formatter};
 use std::fs;
 use std::path::PathBuf;
+use std::slice;
 use std::str::FromStr;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -338,13 +339,15 @@ pub struct Sampler {
     /// How far the sampler reaches. Without one it takes no rows of its own, unless `of`
     /// narrows it to the rows that belong to its parents.
     pub limit: Option<Limit>,
-    /// `my_column: parent.column`: only rows that belong to the parent's extracted rows.
-    #[serde(default)]
-    pub of: BTreeMap<String, ColumnRef>,
+    /// `my_column: parent.column`: only rows that belong to the parent's extracted rows. A list
+    /// of such maps gives one reference over several columns for each item.
+    #[serde(default, deserialize_with = "references")]
+    pub of: BTreeMap<Columns, ColumnRef>,
     /// `my_column: parent.column`: the parent rows this table's rows point at get extracted too.
-    /// Applies to every row of the table, whichever sampler brought it in.
-    #[serde(default)]
-    pub deps: BTreeMap<String, ColumnRef>,
+    /// Applies to every row of the table, whichever sampler brought it in. A list of such maps
+    /// gives one reference over several columns for each item.
+    #[serde(default, deserialize_with = "references")]
+    pub deps: BTreeMap<Columns, ColumnRef>,
     /// Where the sampler was defined, for messages: `users.yml sampler #2 (users)`.
     #[serde(skip)]
     pub origin: String,
@@ -516,17 +519,77 @@ fn since_columns(value: Value) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
-/// A `table.column` reference to a parent's extracted rows.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(try_from = "String")]
+/// The columns on one side of a reference: one, or several for a composite key. The columns on
+/// the two sides pair up by position.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Columns(Vec<String>);
+
+impl Columns {
+    /// Wraps `columns`, which must not be empty.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `columns` is empty.
+    #[must_use]
+    pub fn new(columns: Vec<String>) -> Self {
+        assert!(
+            !columns.is_empty(),
+            "a reference follows at least one column"
+        );
+        Self(columns)
+    }
+
+    /// Returns the column names, in order.
+    #[must_use]
+    pub fn as_slice(&self) -> &[String] {
+        &self.0
+    }
+
+    /// Iterates over the column names, in order.
+    pub fn iter(&self) -> slice::Iter<'_, String> {
+        self.0.iter()
+    }
+}
+
+impl From<&str> for Columns {
+    fn from(column: &str) -> Self {
+        Self(vec![column.to_string()])
+    }
+}
+
+impl Display for Columns {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self.0.as_slice() {
+            [column] => f.write_str(column),
+            columns => write!(f, "({})", columns.join(", ")),
+        }
+    }
+}
+
+/// A parent's columns, and the table or named sampler whose extracted rows they read.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ColumnRef {
     /// The parent table, or the name of a sampler of it.
     pub table: String,
-    /// The parent's column.
-    pub column: String,
+    /// The parent's columns.
+    pub columns: Columns,
 }
 
-impl TryFrom<String> for ColumnRef {
+impl Display for ColumnRef {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}", self.table, self.columns)
+    }
+}
+
+/// A `table.column` as written in YAML.
+#[derive(Debug, Deserialize)]
+#[serde(try_from = "String")]
+struct Target {
+    table: String,
+    column: String,
+}
+
+impl TryFrom<String> for Target {
     type Error = String;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
@@ -544,10 +607,118 @@ impl TryFrom<String> for ColumnRef {
     }
 }
 
-impl Display for ColumnRef {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "{}.{}", self.table, self.column)
+/// One reference written as a list item: the `column: table.column` entries of a composite key.
+struct Reference(Vec<(String, Target)>);
+
+impl<'de> Deserialize<'de> for Reference {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+
+        impl<'de> de::Visitor<'de> for Visitor {
+            type Value = Reference;
+
+            fn expecting(&self, f: &mut Formatter<'_>) -> fmt::Result {
+                f.write_str("a map of `column: table.column`")
+            }
+
+            fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Reference, A::Error> {
+                let mut entries: Vec<(String, Target)> = Vec::new();
+                while let Some((column, target)) = map.next_entry::<String, Target>()? {
+                    if entries.iter().any(|(seen, _)| *seen == column) {
+                        return Err(de::Error::custom(format!("`{column}` is listed twice")));
+                    }
+                    entries.push((column, target));
+                }
+                Ok(Reference(entries))
+            }
+        }
+
+        deserializer.deserialize_map(Visitor)
     }
+}
+
+impl Reference {
+    /// Pairs the columns, sorted by the child's column so the order they're written in doesn't
+    /// matter. Fails when they point at different tables.
+    fn into_entry(self) -> Result<(Columns, ColumnRef), String> {
+        let mut entries = self.0;
+        entries.sort_by(|first, second| first.0.cmp(&second.0));
+        let Some((first_column, first)) = entries.first() else {
+            return Err("a reference needs at least one column".to_string());
+        };
+        if let Some((column, other)) = entries
+            .iter()
+            .find(|(_, target)| target.table != first.table)
+        {
+            return Err(format!(
+                "one reference's columns must point at one table, but `{first_column}` points at \
+                 {} and `{column}` at {}",
+                first.table, other.table
+            ));
+        }
+        let table = first.table.clone();
+        let (children, parents): (Vec<String>, Vec<String>) = entries
+            .into_iter()
+            .map(|(column, target)| (column, target.column))
+            .unzip();
+        Ok((
+            Columns::new(children),
+            ColumnRef {
+                table,
+                columns: Columns::new(parents),
+            },
+        ))
+    }
+}
+
+/// Reads `of` or `deps`: a map of `my_column: table.column`, one reference for each entry, or a
+/// list of such maps, one reference for each item.
+fn references<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<Columns, ColumnRef>, D::Error> {
+    struct Visitor;
+
+    impl Visitor {
+        fn add<E: de::Error>(
+            found: &mut BTreeMap<Columns, ColumnRef>,
+            reference: Reference,
+        ) -> Result<(), E> {
+            let (columns, parent) = reference.into_entry().map_err(E::custom)?;
+            if found.contains_key(&columns) {
+                return Err(E::custom(format!("`{columns}` is listed twice")));
+            }
+            found.insert(columns, parent);
+            Ok(())
+        }
+    }
+
+    impl<'de> de::Visitor<'de> for Visitor {
+        type Value = BTreeMap<Columns, ColumnRef>;
+
+        fn expecting(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            f.write_str(
+                "a map of `column: table.column`, or a list of such maps, one for each reference",
+            )
+        }
+
+        fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut found: BTreeMap<Columns, ColumnRef> = BTreeMap::new();
+            while let Some((column, target)) = map.next_entry::<String, Target>()? {
+                Self::add(&mut found, Reference(vec![(column, target)]))?;
+            }
+            Ok(found)
+        }
+
+        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut found: BTreeMap<Columns, ColumnRef> = BTreeMap::new();
+            while let Some(reference) = seq.next_element::<Reference>()? {
+                Self::add(&mut found, reference)?;
+            }
+            Ok(found)
+        }
+    }
+
+    deserializer.deserialize_any(Visitor)
 }
 
 impl Config {
@@ -668,10 +839,10 @@ samplers:
         assert_eq!(users.order_by.as_deref(), Some("id DESC"));
         assert_eq!(users.limit, count(100));
         assert_eq!(
-            users.of["country_id"],
+            users.of[&Columns::from("country_id")],
             ColumnRef {
                 table: "countries".to_string(),
-                column: "id".to_string(),
+                columns: Columns::from("id"),
             }
         );
         assert!(!users.is_unfiltered(), "users has a filter: {users:?}");
@@ -860,6 +1031,92 @@ samplers:
                 .expect_err("a dep must be `table.column`");
             assert!(error.to_string().contains("table.column"), "{bad}: {error}");
         }
+    }
+
+    #[test]
+    fn a_list_item_is_one_reference_over_several_columns() -> Result<()> {
+        let config: Config = r#"
+samplers:
+  - table: memberships
+    limit: all
+    deps:
+      - { user_id: users.id, tenant_id: users.tenant_id }
+      - { created_by: users.id }
+    of:
+      - { shop_id: shops.shop_id, order_id: shops.id }
+"#
+        .parse()?;
+        let sampler = &config.samplers[0];
+
+        let composite = Columns::new(vec!["tenant_id".to_string(), "user_id".to_string()]);
+        assert_eq!(
+            sampler.deps[&composite],
+            ColumnRef {
+                table: "users".to_string(),
+                columns: Columns::new(vec!["tenant_id".to_string(), "id".to_string()]),
+            },
+            "columns are paired, and sorted by the child's column so their order doesn't matter"
+        );
+        assert_eq!(
+            sampler.deps[&Columns::from("created_by")].to_string(),
+            "users.id",
+            "another item is another reference"
+        );
+        assert_eq!(sampler.deps.len(), 2);
+        assert_eq!(sampler.of.len(), 1, "`of` takes the list form too");
+        assert_eq!(composite.to_string(), "(tenant_id, user_id)");
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_a_reference_that_points_at_two_tables() {
+        let error = r#"
+samplers:
+  - table: memberships
+    limit: all
+    deps:
+      - { user_id: users.id, shop_id: shops.id }
+"#
+        .parse::<Config>()
+        .expect_err("one reference points at one table");
+        assert!(
+            error.to_string().contains(
+                "one reference's columns must point at one table, but `shop_id` points at shops \
+                 and `user_id` at users"
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_the_same_columns_listed_twice() {
+        for deps in [
+            "- { user_id: users.id }\n      - { user_id: users.id }",
+            "- { a: t.x, b: t.y }\n      - { b: t.y, a: t.x }",
+        ] {
+            let yaml = format!(
+                "samplers:\n  - table: memberships\n    limit: all\n    deps:\n      {deps}\n"
+            );
+            let error = yaml
+                .parse::<Config>()
+                .expect_err("a reference can't be listed twice");
+            assert!(error.to_string().contains("is listed twice"), "{error}");
+        }
+    }
+
+    #[test]
+    fn two_references_may_share_a_column() -> Result<()> {
+        let config: Config = r#"
+samplers:
+  - table: tasks
+    limit: all
+    deps:
+      - { tenant_id: users.tenant_id, user_id: users.id }
+      - { tenant_id: projects.tenant_id, project_id: projects.id }
+"#
+        .parse()?;
+        assert_eq!(config.samplers[0].deps.len(), 2, "both keys use tenant_id");
+        Ok(())
     }
 
     #[test]

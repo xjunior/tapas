@@ -24,11 +24,11 @@ This page is for people changing tapas.
    the condition when its queries are built, and doesn't count as taking every row when `--since` is a span. A
    sampler with no `limit` and no `of` takes no rows, so it never runs; its `deps` still count.
 2. Each `deps` reference, `table.column → parent.column`, becomes one extra sampler on the parent:
-   `of: { parent.column: table.column }`. A parent that already takes every row gets none.
+   `of: { parent.column: table.column }`. A reference over several columns stays one reference. A parent that already takes every row gets none.
 3. Each `of` adds an edge from the parent table to the child. A named sampler stands for its table.
 4. Tarjan's algorithm groups the tables into strongly connected components. A component with several tables, or one
    table that follows itself, is a cycle.
-5. Every table remembers the columns its children follow (`keep`), and named samplers do the same for their own rows.
+5. Every table remembers the columns its children follow (`keep`), and named samplers do the same for their own rows. A composite key is remembered as one tuple of literals, `(1, 2)`, which goes into `(a, b) IN (...)` as it is. A key with a NULL part isn't remembered.
 
 A table is **full** when one of its samplers takes every row. An `of` on a full table needs no values: it becomes
 `column IS NOT NULL`.

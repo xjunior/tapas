@@ -13,6 +13,7 @@ use tokio::task::JoinSet;
 use tokio_postgres::SimpleQueryMessage;
 use xxhash_rust::xxh3;
 
+use crate::config::Columns;
 use crate::plan::Plan;
 use crate::postgres;
 use crate::sanitize::{Placed, Sanitizer, Scratch, Seed};
@@ -76,7 +77,7 @@ impl KeySet {
 #[derive(Debug, Clone, Default)]
 struct TableState {
     /// Literals of the values extracted so far, per kept column.
-    keys: BTreeMap<String, KeySet>,
+    keys: BTreeMap<Columns, KeySet>,
     /// Hashes of rows written so far, for tables with more than one sampler.
     seen: HashSet<u128>,
     rows: u64,
@@ -85,8 +86,8 @@ struct TableState {
 impl TableState {
     /// Starts with no rows, keeping the values of `columns`.
     #[must_use]
-    fn new_with_keys(columns: &BTreeSet<String>) -> Self {
-        let keys: BTreeMap<String, KeySet> = columns
+    fn new_with_keys(columns: &BTreeSet<Columns>) -> Self {
+        let keys: BTreeMap<Columns, KeySet> = columns
             .iter()
             .map(|column| (column.clone(), KeySet::default()))
             .collect();
@@ -366,11 +367,11 @@ fn current_deps(
     sampler
         .of
         .iter()
-        .map(|(column, parent)| {
-            let column = column.clone();
+        .map(|(columns, parent)| {
+            let columns = columns.clone();
             if plan.allows_any(parent) {
                 return Dep {
-                    column,
+                    columns,
                     allowed: Allowed::AnyValue,
                 };
             }
@@ -378,16 +379,16 @@ fn current_deps(
                 Some(named) => lock(named),
                 None => lock(&context.tables[&parent.table]),
             };
-            let keys = &state.keys[&parent.column];
+            let keys = &state.keys[&parent.columns];
             let from = match cursors.as_deref_mut() {
-                Some(cursors) if cycle_deps == [column.as_str()] => {
+                Some(cursors) if cycle_deps == [&columns] => {
                     let cursor = cursors.entry(index).or_insert(0);
                     mem::replace(cursor, keys.found())
                 }
                 _ => 0,
             };
             Dep {
-                column,
+                columns,
                 allowed: Allowed::Values(keys.values_from(from)),
             }
         })
@@ -646,12 +647,12 @@ impl<'query> Batcher<'query> {
     }
 }
 
-/// A column of a query's rows whose values are remembered.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// The columns of a reference whose values are remembered.
+#[derive(Debug, Clone, PartialEq)]
 struct KeptColumn<'plan> {
-    name: &'plan str,
-    /// Where the column sits in the query's rows.
-    position: usize,
+    columns: &'plan Columns,
+    /// Where each of the columns sits in the query's rows.
+    positions: Vec<usize>,
 }
 
 /// The columns of a query's rows to remember for the sampler's own name.
@@ -670,19 +671,23 @@ struct Keep<'plan> {
 
 /// Finds where each of `columns` sits among a query's column `names`. Fails if `table` lacks one.
 fn kept_columns<'plan>(
-    columns: &'plan BTreeSet<String>,
+    kept_columns: &'plan BTreeSet<Columns>,
     names: &[String],
     table: &str,
 ) -> Result<Vec<KeptColumn<'plan>>> {
-    let mut kept = Vec::with_capacity(columns.len());
-    for name in columns {
-        let position = names
-            .iter()
-            .position(|found| found == name)
-            .ok_or_else(|| {
-                anyhow!("{table} has no column {name}, which another sampler depends on")
-            })?;
-        kept.push(KeptColumn { name, position });
+    let mut kept = Vec::with_capacity(kept_columns.len());
+    for columns in kept_columns {
+        let mut positions = Vec::with_capacity(columns.as_slice().len());
+        for name in columns.iter() {
+            let position = names
+                .iter()
+                .position(|found| found == name)
+                .ok_or_else(|| {
+                    anyhow!("{table} has no column {name}, which another sampler depends on")
+                })?;
+            positions.push(position);
+        }
+        kept.push(KeptColumn { columns, positions });
     }
     Ok(kept)
 }
@@ -695,19 +700,20 @@ async fn write_batch(
     sanitize: &Placed<'_>,
     batch: Vec<Vec<Vec<u8>>>,
 ) -> Result<()> {
+    // Reused for every composite key of the batch.
+    let mut tuple: Vec<u8> = Vec::new();
+
     // A named sampler's keys come from every row it returned, even rows another sampler of the
     // table already wrote.
     if let Some(named) = &keep.named {
         let mut state = lock(&context.named[named.name]);
         for row in &batch {
             for column in &named.columns {
-                if row[column.position] != sql::NULL {
-                    state
-                        .keys
-                        .get_mut(column.name)
-                        .expect("a named sampler's state has a key set per kept column")
-                        .insert(&row[column.position]);
-                }
+                let keys = state
+                    .keys
+                    .get_mut(column.columns)
+                    .expect("a named sampler's state has a key set per kept column");
+                remember(keys, row, &column.positions, &mut tuple);
             }
         }
     }
@@ -721,13 +727,11 @@ async fn write_batch(
                 continue;
             }
             for column in &keep.table {
-                if row[column.position] != sql::NULL {
-                    state
-                        .keys
-                        .get_mut(column.name)
-                        .expect("a table's state has a key set per kept column")
-                        .insert(&row[column.position]);
-                }
+                let keys = state
+                    .keys
+                    .get_mut(column.columns)
+                    .expect("a table's state has a key set per kept column");
+                remember(keys, &row, &column.positions, &mut tuple);
             }
             rows.push(row);
         }
@@ -751,6 +755,32 @@ async fn write_batch(
             .map_err(|_| anyhow!("the output stopped taking statements"))?;
     }
     Ok(())
+}
+
+/// Remembers the value `row` holds in a kept column in `keys`: its literal, or for a composite
+/// reference the literals of its columns as a tuple, such as `(1, 2)`, which `IN` takes as it is.
+/// A NULL in any of the columns points at nothing, so nothing is remembered. `tuple` is scratch
+/// space, reused from row to row.
+fn remember(keys: &mut KeySet, row: &[Vec<u8>], positions: &[usize], tuple: &mut Vec<u8>) {
+    if let [position] = positions {
+        if row[*position] != sql::NULL {
+            keys.insert(&row[*position]);
+        }
+        return;
+    }
+    tuple.clear();
+    tuple.push(b'(');
+    for (index, &position) in positions.iter().enumerate() {
+        if row[position] == sql::NULL {
+            return;
+        }
+        if index > 0 {
+            tuple.extend_from_slice(b", ");
+        }
+        tuple.extend_from_slice(&row[position]);
+    }
+    tuple.push(b')');
+    keys.insert(tuple);
 }
 
 #[must_use]
@@ -777,6 +807,34 @@ mod tests {
 
     fn row(values: &[&[u8]]) -> Vec<Vec<u8>> {
         values.iter().map(|value| value.to_vec()).collect()
+    }
+
+    #[test]
+    fn remembers_a_composite_key_as_one_tuple() {
+        let row = row(&[b"7", b"1", b"NULL", b"'a'"]);
+        let mut tuple = Vec::new();
+
+        let mut keys = KeySet::default();
+        remember(&mut keys, &row, &[1, 0], &mut tuple);
+        remember(&mut keys, &row, &[0, 3], &mut tuple);
+        assert_eq!(
+            keys.values_from(0),
+            [b"(1, 7)".to_vec(), b"(7, 'a')".to_vec()],
+            "each key is its columns' literals in order"
+        );
+
+        let mut keys = KeySet::default();
+        remember(&mut keys, &row, &[0, 2], &mut tuple);
+        assert_eq!(keys.found(), 0, "a key with a NULL part points at nothing");
+
+        remember(&mut keys, &row, &[1], &mut tuple);
+        assert_eq!(
+            keys.values_from(0),
+            [b"1".to_vec()],
+            "one column is remembered as it is"
+        );
+        remember(&mut keys, &row, &[2], &mut tuple);
+        assert_eq!(keys.found(), 1, "a NULL is not remembered");
     }
 
     #[test]
