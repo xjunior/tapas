@@ -488,7 +488,7 @@ async fn run_mysql_query(context: &Shared, index: usize, pool: &Pool, query: &[u
         .collect();
     let kinds: Vec<Kind> = columns
         .iter()
-        .map(|column| Kind::new(column.column_type(), column.character_set()))
+        .map(|column| sql::mysql::column_kind(column.column_type(), column.character_set()))
         .collect();
     let mut batcher = Batcher::try_new(context, index, &names, &kinds)?;
 

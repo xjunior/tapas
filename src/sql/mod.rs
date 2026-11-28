@@ -3,7 +3,7 @@
 mod dialect;
 mod insert;
 mod kind;
-mod mysql;
+pub mod mysql;
 mod postgres;
 mod select;
 #[cfg(test)]

@@ -4,6 +4,7 @@ use mysql_async::consts::ColumnType;
 
 use super::*;
 use crate::config::{Columns, Sampler};
+use crate::sql::mysql;
 
 fn sampler(table: &str, filter: Option<&str>, order_by: Option<&str>) -> Sampler {
     Sampler {
@@ -44,23 +45,38 @@ fn quotes_identifiers() {
 
 #[test]
 fn picks_kinds() {
-    assert_eq!(Kind::new(ColumnType::MYSQL_TYPE_LONGLONG, 63), Kind::Number);
     assert_eq!(
-        Kind::new(ColumnType::MYSQL_TYPE_NEWDECIMAL, 63),
+        mysql::column_kind(ColumnType::MYSQL_TYPE_LONGLONG, 63),
         Kind::Number
     );
-    assert_eq!(Kind::new(ColumnType::MYSQL_TYPE_DATETIME, 63), Kind::Text);
-    assert_eq!(Kind::new(ColumnType::MYSQL_TYPE_JSON, 63), Kind::Text);
     assert_eq!(
-        Kind::new(ColumnType::MYSQL_TYPE_VAR_STRING, 255),
+        mysql::column_kind(ColumnType::MYSQL_TYPE_NEWDECIMAL, 63),
+        Kind::Number
+    );
+    assert_eq!(
+        mysql::column_kind(ColumnType::MYSQL_TYPE_DATETIME, 63),
         Kind::Text
     );
     assert_eq!(
-        Kind::new(ColumnType::MYSQL_TYPE_VAR_STRING, 63),
+        mysql::column_kind(ColumnType::MYSQL_TYPE_JSON, 63),
+        Kind::Text
+    );
+    assert_eq!(
+        mysql::column_kind(ColumnType::MYSQL_TYPE_VAR_STRING, 255),
+        Kind::Text
+    );
+    assert_eq!(
+        mysql::column_kind(ColumnType::MYSQL_TYPE_VAR_STRING, 63),
         Kind::Binary
     );
-    assert_eq!(Kind::new(ColumnType::MYSQL_TYPE_BLOB, 63), Kind::Binary);
-    assert_eq!(Kind::new(ColumnType::MYSQL_TYPE_BIT, 63), Kind::Binary);
+    assert_eq!(
+        mysql::column_kind(ColumnType::MYSQL_TYPE_BLOB, 63),
+        Kind::Binary
+    );
+    assert_eq!(
+        mysql::column_kind(ColumnType::MYSQL_TYPE_BIT, 63),
+        Kind::Binary
+    );
 }
 
 #[test]
