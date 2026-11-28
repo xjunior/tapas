@@ -29,13 +29,14 @@ docker rm -f tapas-mysql tapas-postgres
 | --- | --- |
 | `tests/end_to_end.rs` | Several samplers per table, limits across chunks, `--since`, and values that make the trip unchanged. |
 | `tests/references.rs` | `deps` pulling in the rows it points at, whatever the parent's own filters. |
+| `tests/foreign_keys.rs` | Reading foreign keys, following them like the `deps` that say the same, and `--deps` without a source. |
 | `tests/composite.rs` | `of` and `deps` over several columns, where a user's id alone doesn't say which user it is. |
 | `tests/reach.rs` | `limit` with `rows` and `since` together, and tables that only `deps` pull in. |
 | `tests/target.rs` | Writing straight into a target database, refusing to write into the source, and what errors show of a refused statement. |
 | `tests/errors.rs` | What errors show of a failed source query, with and without `--debug`. |
 | `tests/cycles.rs` | A table that follows itself, two tables that follow each other, and named samplers. |
 | `tests/sanitize.rs` | Every kind of replacement, fakes that agree across tables and runs, and refusing rules that break references. |
-| `tests/postgres.rs` | Postgres: values of many types that make the trip unchanged, cycles, sequences, sanitizing, composite references, and what a target user needs. |
+| `tests/postgres.rs` | Postgres: values of many types that make the trip unchanged, cycles, sequences, sanitizing, composite references, foreign keys, and what a target user needs. |
 
 Each one creates its own databases and drops them when it passes.
 

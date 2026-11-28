@@ -548,3 +548,105 @@ samplers:
     drop_databases(&admin, databases).await?;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn follows_foreign_keys_in_postgres() -> Result<()> {
+    let Ok(base) = env::var("TAPAS_TEST_POSTGRES_URL") else {
+        eprintln!("TAPAS_TEST_POSTGRES_URL not set, skipping");
+        return Ok(());
+    };
+    // Every tenant has users 1 and 2, and a manager is a user of the same tenant.
+    const KEYS_SCHEMA: &str = r#"
+CREATE TABLE territories (id integer PRIMARY KEY);
+CREATE TABLE users (
+  tenant_id integer NOT NULL, id integer NOT NULL, territory_id integer, manager_id integer,
+  PRIMARY KEY (tenant_id, id),
+  CONSTRAINT users_territory_fk FOREIGN KEY (territory_id) REFERENCES territories (id),
+  CONSTRAINT users_manager_fk FOREIGN KEY (tenant_id, manager_id) REFERENCES users (tenant_id, id)
+);
+CREATE TABLE orders (
+  id integer PRIMARY KEY, tenant_id integer NOT NULL, user_id integer NOT NULL,
+  CONSTRAINT orders_user_fk FOREIGN KEY (tenant_id, user_id) REFERENCES users (tenant_id, id)
+);
+"#;
+    const KEYS_SEED: &str = r#"
+INSERT INTO territories VALUES (1), (2), (3);
+INSERT INTO users VALUES (1, 1, 1, NULL), (1, 2, 2, 1), (1, 3, NULL, 2), (2, 1, 1, NULL), (2, 2, 3, 1);
+INSERT INTO orders VALUES (1, 1, 3), (2, 2, 1), (3, 2, 2);
+"#;
+    let databases = ["tapas_pg_keys_source", "tapas_pg_keys_target"];
+    let admin = connect(&format!("{base}/postgres")).await?;
+    for database in databases {
+        admin
+            .batch_execute(&format!("DROP DATABASE IF EXISTS {database} WITH (FORCE)"))
+            .await?;
+        admin
+            .batch_execute(&format!("CREATE DATABASE {database}"))
+            .await?;
+        let client = connect(&format!("{base}/{database}")).await?;
+        client.batch_execute(KEYS_SCHEMA).await?;
+        if database == databases[0] {
+            client.batch_execute(KEYS_SEED).await?;
+        }
+    }
+    let source_url = format!("{base}/{}", databases[0]);
+
+    let keys = tapas::foreign_keys(&source_url).await?;
+    let described: Vec<String> = keys
+        .iter()
+        .map(|key| {
+            format!(
+                "{}: {}.{} -> {}",
+                key.name, key.table, key.columns, key.parent
+            )
+        })
+        .collect();
+    assert_eq!(
+        described,
+        [
+            "orders_user_fk: orders.(tenant_id, user_id) -> users.(tenant_id, id)",
+            "users_manager_fk: users.(tenant_id, manager_id) -> users.(tenant_id, id)",
+            "users_territory_fk: users.territory_id -> territories.id",
+        ]
+    );
+
+    let config: Config =
+        "samplers:\n  - table: orders\n    where: id <= 2\n    limit: all\n".parse()?;
+    let output = env::temp_dir().join(format!("tapas-pg-keys-{}.sql", process::id()));
+    tapas::run(
+        Plan::try_new_with_foreign_keys(config, None, &keys)?,
+        &source_url,
+        4,
+        &Output::File(output.clone()),
+        Options {
+            chunk_size: 1,
+            ..Options::default()
+        },
+    )
+    .await?;
+    let sample = fs::read_to_string(&output)?;
+    fs::remove_file(&output)?;
+    let target = connect(&format!("{base}/{}", databases[1])).await?;
+    target.batch_execute(&sample).await?;
+
+    assert_eq!(
+        scalar(
+            &target,
+            "SELECT string_agg(tenant_id || '.' || id, ' ' ORDER BY tenant_id, id) FROM users"
+        )
+        .await?,
+        "1.1 1.2 1.3 2.1",
+        "the orders' users and their managers, but not tenant 2's user 2"
+    );
+    assert_eq!(
+        scalar(
+            &target,
+            "SELECT string_agg(id::text, ' ' ORDER BY id) FROM territories"
+        )
+        .await?,
+        "1 2"
+    );
+
+    drop_databases(&admin, databases).await?;
+    Ok(())
+}

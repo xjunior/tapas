@@ -13,7 +13,7 @@ This page is for people changing tapas.
 | `sanitize` | Works out what each table's sanitize rules do to its columns, and rewrites rows to match. |
 | `fake` | Makes fake values from a seed. |
 | `extract` | Runs the plan: schedules samplers, streams rows, and keeps the values children need. |
-| `source` | Opens the source's read-only connections and reads the columns the sanitize rules cover. |
+| `source` | Opens the source's read-only connections, and reads the columns the sanitize rules cover and the foreign keys. |
 | `postgres` | Connects to Postgres, over TLS when the server offers it, and pools the source's connections. |
 | `output` | Writes the sample: a SQL file on its own thread, or a target database in one transaction. |
 | `run` | Picks MySQL or Postgres from the URLs, refuses a target of another kind, and wires the source, the plan, the extraction and the output together. |
@@ -25,6 +25,9 @@ This page is for people changing tapas.
    sampler with no `limit` and no `of` takes no rows, so it never runs; its `deps` still count.
 2. Each `deps` reference, `table.column → parent.column`, becomes one extra sampler on the parent:
    `of: { parent.column: table.column }`. A reference over several columns stays one reference. A parent that already takes every row gets none.
+   With `--deps foreign-keys`, `run::foreign_keys` first reads the source's foreign keys in one query. The plan starts
+   from the tables the samplers and their `deps` name, adds the keys of each, and follows them to their parents until
+   nothing new turns up. A key becomes a reference like a `deps` entry, unless a `deps` entry says the same.
 3. Each `of` adds an edge from the parent table to the child. A named sampler stands for its table.
 4. Tarjan's algorithm groups the tables into strongly connected components. A component with several tables, or one
    table that follows itself, is a cycle.

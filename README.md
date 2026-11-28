@@ -8,8 +8,8 @@ what to take in YAML; tapas works out the order, runs everything it can in paral
 one that was left behind.
 
 - **Samplers.** Pick rows per table with plain SQL, a time window, a limit, or by following other tables.
-- **References that hold.** `deps` brings along every row your rows point at. `of` takes the rows that belong to what's
-  already in the sample.
+- **References that hold.** `deps` brings along every row your rows point at, or let tapas follow the foreign keys
+  itself. `of` takes the rows that belong to what's already in the sample.
 - **One config, many sizes.** `--since '2 weeks'` for a laptop, `--since '3 months'` for a review environment.
 - **No personal data.** Replace emails, names, SSNs and more with fakes that look real. The same email gets the same
   fake everywhere it appears, so data that matched still matches.
@@ -81,6 +81,9 @@ Postgres works the same way, with `postgres://` URLs:
 tapas tapas.yml --since '2 weeks' --source postgres://user:password@host:5432/shop -o sample.sql
 psql shop_dev -f sample.sql
 ```
+
+Don't want to write `deps` by hand? Add `deps: foreign_keys` to the config, or pass `--deps foreign-keys`, and tapas
+follows the source's foreign keys.
 
 Either way tapas writes `INSERT` statements only, so the target needs the schema already. Passwords can stay off the
 command line too: see [Command line](docs/cli.md#connection-urls). There's a fuller example in

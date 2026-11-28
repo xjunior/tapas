@@ -39,5 +39,9 @@ What tapas doesn't do yet, or does in a way worth knowing about.
 
 - **No variables.** `where` is plain SQL; `--since` is the only value that changes per run.
 - **A `deps` sampler can't follow a named sampler.** Use `of` for that.
+- **Foreign keys are the ones the database enforces.** A reference that exists only in the application needs a `deps`
+  entry. tapas reads the keys of the connection's current schema, and ignores one that points at another schema.
+- **A foreign key is followed from every table the sample reaches.** One to a table you'd rather leave out can't be
+  skipped yet; use `--deps declared` and write the `deps` you want.
 - **A sampler that runs in rounds can't cap its rows.** `limit: all` and `limit: { since: … }` work; `limit: 100` doesn't.
 - **Every table needs a primary key, or whole rows that differ.** Duplicates are found by hashing whole rows.

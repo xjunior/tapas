@@ -6,6 +6,8 @@ use anyhow::{Context, Result};
 use mysql_async::{Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts};
 use tokio_postgres::SimpleQueryMessage;
 
+use crate::config::{ColumnRef, Columns};
+use crate::plan::ForeignKey;
 use crate::postgres;
 use crate::sanitize::ColumnInfo;
 use crate::sql::{self, Dialect};
@@ -113,6 +115,41 @@ impl Source {
         Ok(columns)
     }
 
+    /// Returns the foreign keys between tables of the current database, which a sample follows
+    /// like `deps`. A key over several columns is one entry.
+    pub async fn foreign_keys(&self) -> Result<Vec<ForeignKey>> {
+        use mysql_async::prelude::Queryable;
+
+        let query = sql::foreign_keys_query(self.dialect());
+        let rows: Vec<(String, String, String, String, String)> = match self {
+            Source::MySql(pool) => pool
+                .get_conn()
+                .await?
+                .query(query)
+                .await
+                .context("reading the source's foreign keys")?,
+            Source::Postgres(pool) => {
+                let messages = pool
+                    .get()
+                    .await?
+                    .simple_query(query)
+                    .await
+                    .context("reading the source's foreign keys")?;
+                let mut rows = Vec::new();
+                for message in messages {
+                    // Every value comes as text.
+                    let SimpleQueryMessage::Row(row) = message else {
+                        continue;
+                    };
+                    let text = |index: usize| row.get(index).unwrap_or_default().to_string();
+                    rows.push((text(0), text(1), text(2), text(3), text(4)));
+                }
+                rows
+            }
+        };
+        Ok(group_foreign_keys(rows))
+    }
+
     /// Closes every connection.
     pub async fn disconnect(self) {
         match self {
@@ -121,5 +158,89 @@ impl Source {
             }
             Source::Postgres(pool) => pool.close(),
         }
+    }
+}
+
+/// Joins the rows of a foreign keys query, one per column of a key, into one entry per key. Rows
+/// of one key come together and in the key's order.
+#[must_use]
+fn group_foreign_keys(rows: Vec<(String, String, String, String, String)>) -> Vec<ForeignKey> {
+    let mut keys: Vec<(ForeignKey, Vec<String>, Vec<String>)> = Vec::new();
+    for (name, table, column, parent, parent_column) in rows {
+        match keys.last_mut() {
+            Some((key, columns, parent_columns)) if key.name == name && key.table == table => {
+                columns.push(column);
+                parent_columns.push(parent_column);
+            }
+            _ => keys.push((
+                ForeignKey {
+                    name,
+                    table,
+                    columns: Columns::from(column.as_str()),
+                    parent: ColumnRef {
+                        table: parent,
+                        columns: Columns::from(parent_column.as_str()),
+                    },
+                },
+                vec![column],
+                vec![parent_column],
+            )),
+        }
+    }
+    keys.into_iter()
+        .map(|(mut key, columns, parent_columns)| {
+            key.columns = Columns::new(columns);
+            key.parent.columns = Columns::new(parent_columns);
+            key
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(
+        name: &str,
+        table: &str,
+        column: &str,
+        parent: &str,
+        to: &str,
+    ) -> (String, String, String, String, String) {
+        let text = |value: &str| value.to_string();
+        (
+            text(name),
+            text(table),
+            text(column),
+            text(parent),
+            text(to),
+        )
+    }
+
+    #[test]
+    fn joins_the_columns_of_a_key() {
+        let keys = group_foreign_keys(vec![
+            row(
+                "memberships_user_fk",
+                "memberships",
+                "tenant_id",
+                "users",
+                "tenant_id",
+            ),
+            row(
+                "memberships_user_fk",
+                "memberships",
+                "user_id",
+                "users",
+                "id",
+            ),
+            row("orders_user_fk", "orders", "user_id", "users", "id"),
+        ]);
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].name, "memberships_user_fk");
+        assert_eq!(keys[0].columns.to_string(), "(tenant_id, user_id)");
+        assert_eq!(keys[0].parent.to_string(), "users.(tenant_id, id)");
+        assert_eq!(keys[1].columns.to_string(), "user_id");
+        assert_eq!(keys[1].parent.to_string(), "users.id");
     }
 }

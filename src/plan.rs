@@ -29,6 +29,20 @@ pub struct TablePlan {
     pub cycle: Option<usize>,
 }
 
+/// A foreign key of the source database: the rows of `table` point at rows of `parent` through
+/// `columns`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForeignKey {
+    /// The constraint's name.
+    pub name: String,
+    /// The table that holds the key.
+    pub table: String,
+    /// The key's columns in `table`.
+    pub columns: Columns,
+    /// The parent table, and its columns, paired with `columns` by position.
+    pub parent: ColumnRef,
+}
+
 /// Holds every sampler, and what the extraction needs to know to run them in order.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Plan {
@@ -54,11 +68,23 @@ impl Plan {
     /// Plans the extraction of `config`'s samplers, limited by `since`. Fails when the samplers
     /// contradict each other or depend on tables nothing extracts.
     pub fn try_new(config: Config, since: Option<Since>) -> Result<Self> {
+        Self::try_new_with_foreign_keys(config, since, &[])
+    }
+
+    /// Like [`Plan::try_new`], and the rows that the tables of the sample point at through
+    /// `foreign_keys` come along too, as if each key were a `deps` entry. A declared `deps` entry
+    /// adds to them, and fails if it says a key's columns point at another table.
+    pub fn try_new_with_foreign_keys(
+        config: Config,
+        since: Option<Since>,
+        foreign_keys: &[ForeignKey],
+    ) -> Result<Self> {
         let Config {
             mut samplers,
             sanitize,
+            deps: _,
         } = config;
-        pull_referenced_rows(&mut samplers, since)?;
+        pull_referenced_rows(&mut samplers, since, foreign_keys)?;
 
         let mut tables: BTreeMap<String, TablePlan> = BTreeMap::new();
 
@@ -432,11 +458,29 @@ impl Plan {
     }
 }
 
-/// Turns `deps` into samplers. A dep says this table's rows point at the parent's rows, so the
-/// parent gets a sampler for exactly the rows they point at: `of: { parent_column: table.column }`.
-/// Deps belong to the table, so the pulled rows include those pointed at by rows other samplers
-/// (pulls included) brought in. A parent that keeps every row needs no pull.
-fn pull_referenced_rows(samplers: &mut Vec<Sampler>, since: Option<Since>) -> Result<()> {
+/// A reference that gets a sampler: the rows of `table` point at `parent` through `columns`.
+struct Reference {
+    table: String,
+    columns: Columns,
+    parent: ColumnRef,
+    /// What brought the reference in, for the pulled sampler's origin.
+    source: String,
+}
+
+/// Turns `deps`, and the source's `foreign_keys`, into samplers. A dep says this table's rows
+/// point at the parent's rows, so the parent gets a sampler for exactly the rows they point at:
+/// `of: { parent_column: table.column }`. Deps belong to the table, so the pulled rows include
+/// those pointed at by rows other samplers (pulls included) brought in. A parent that keeps every
+/// row needs no pull.
+///
+/// A foreign key counts when its table is one the sample reaches, whether a sampler names it or a
+/// reference leads to it. It adds to the declared deps: one that says the same needs no second
+/// pull, and one that says the columns point at another table is an error.
+fn pull_referenced_rows(
+    samplers: &mut Vec<Sampler>,
+    since: Option<Since>,
+    foreign_keys: &[ForeignKey],
+) -> Result<()> {
     let names: BTreeSet<&str> = samplers
         .iter()
         .filter_map(|sampler| sampler.name.as_deref())
@@ -447,7 +491,7 @@ fn pull_referenced_rows(samplers: &mut Vec<Sampler>, since: Option<Since>) -> Re
         .map(|sampler| sampler.table.as_str())
         .collect();
 
-    // (child table, child column) -> (parent table, parent column), each once.
+    // (child table, child columns) -> (parent, declaring sampler), each once.
     let mut edges: BTreeMap<(String, Columns), (ColumnRef, &str)> = BTreeMap::new();
     for sampler in samplers.iter() {
         for (columns, parent) in &sampler.deps {
@@ -473,13 +517,72 @@ fn pull_referenced_rows(samplers: &mut Vec<Sampler>, since: Option<Since>) -> Re
         }
     }
 
-    let pulls: Vec<Sampler> = edges
+    // The tables the sample reaches, and so whose foreign keys count.
+    let mut reached: BTreeSet<String> = samplers
+        .iter()
+        .map(|sampler| sampler.table.clone())
+        .chain(edges.values().map(|(parent, _)| parent.table.clone()))
+        .collect();
+    let mut to_visit: Vec<String> = reached.iter().cloned().collect();
+    let mut keys_of: BTreeMap<&str, Vec<&ForeignKey>> = BTreeMap::new();
+    for key in foreign_keys {
+        keys_of.entry(key.table.as_str()).or_default().push(key);
+    }
+    let mut from_keys: Vec<Reference> = Vec::new();
+    while let Some(table) = to_visit.pop() {
+        for key in keys_of.get(table.as_str()).into_iter().flatten() {
+            match edges.get(&(key.table.clone(), key.columns.clone())) {
+                Some((declared, origin)) if *declared != key.parent => bail!(
+                    "{origin}: {}.{} points at {declared}, but foreign key {} says it points at {}",
+                    key.table,
+                    key.columns,
+                    key.name,
+                    key.parent
+                ),
+                Some(_) => {}
+                None => {
+                    let seen = from_keys.iter().any(|reference| {
+                        reference.table == key.table
+                            && reference.columns == key.columns
+                            && reference.parent == key.parent
+                    });
+                    if !seen {
+                        from_keys.push(Reference {
+                            table: key.table.clone(),
+                            columns: key.columns.clone(),
+                            parent: key.parent.clone(),
+                            source: format!("foreign key {}", key.name),
+                        });
+                    }
+                }
+            }
+            if reached.insert(key.parent.table.clone()) {
+                to_visit.push(key.parent.table.clone());
+            }
+        }
+    }
+
+    let declared = edges
         .into_iter()
-        .filter(|(_, (parent, _))| !full.contains(parent.table.as_str()))
-        .map(|((table, columns), (parent, _))| Sampler {
-            origin: format!("pulled in by {table}.{columns}"),
-            table: parent.table,
-            of: BTreeMap::from([(parent.columns, ColumnRef { table, columns })]),
+        .map(|((table, columns), (parent, _))| Reference {
+            source: format!("{table}.{columns}"),
+            table,
+            columns,
+            parent,
+        });
+    let pulls: Vec<Sampler> = declared
+        .chain(from_keys)
+        .filter(|reference| !full.contains(reference.parent.table.as_str()))
+        .map(|reference| Sampler {
+            origin: format!("pulled in by {}", reference.source),
+            table: reference.parent.table,
+            of: BTreeMap::from([(
+                reference.parent.columns,
+                ColumnRef {
+                    table: reference.table,
+                    columns: reference.columns,
+                },
+            )]),
             ..Sampler::default()
         })
         .collect();
@@ -1236,6 +1339,232 @@ samplers:
             2,
             "one pull for each reference"
         );
+        Ok(())
+    }
+
+    fn key(name: &str, table: &str, columns: &[&str], parent: &str, to: &[&str]) -> ForeignKey {
+        let columns_of =
+            |names: &[&str]| Columns::new(names.iter().map(|name| name.to_string()).collect());
+        ForeignKey {
+            name: name.to_string(),
+            table: table.to_string(),
+            columns: columns_of(columns),
+            parent: ColumnRef {
+                table: parent.to_string(),
+                columns: columns_of(to),
+            },
+        }
+    }
+
+    fn plan_with(yaml: &str, keys: &[ForeignKey]) -> Result<Plan> {
+        Plan::try_new_with_foreign_keys(yaml.parse()?, None, keys)
+    }
+
+    /// The tables of `plan` that have rows, with the samplers' origins that bring them.
+    fn pulls_of<'a>(plan: &'a Plan, table: &str) -> Vec<&'a str> {
+        plan.tables[table]
+            .samplers
+            .iter()
+            .map(|&index| plan.samplers[index].origin.as_str())
+            .collect()
+    }
+
+    const ORDERS: &str = "samplers:\n  - table: orders\n    where: id < 5\n    limit: all\n";
+
+    #[test]
+    fn foreign_keys_pull_in_the_rows_they_point_at_all_the_way_up() -> Result<()> {
+        let keys = [
+            key("orders_user_fk", "orders", &["user_id"], "users", &["id"]),
+            key(
+                "users_territory_fk",
+                "users",
+                &["territory_id"],
+                "territories",
+                &["id"],
+            ),
+            key(
+                "invoices_customer_fk",
+                "invoices",
+                &["customer_id"],
+                "customers",
+                &["id"],
+            ),
+        ];
+        let plan = plan_with(ORDERS, &keys)?;
+
+        assert_eq!(
+            plan.tables.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["orders", "territories", "users"],
+            "invoices and customers aren't reached from orders"
+        );
+        assert_eq!(
+            pulls_of(&plan, "users"),
+            ["pulled in by foreign key orders_user_fk"]
+        );
+        assert_eq!(
+            pulls_of(&plan, "territories"),
+            ["pulled in by foreign key users_territory_fk"]
+        );
+        assert_eq!(
+            plan.tables["orders"].keep,
+            BTreeSet::from([Columns::from("user_id")])
+        );
+        assert!(
+            plan.order.iter().position(|table| table == "territories")
+                > plan.order.iter().position(|table| table == "users"),
+            "parents run first: {:?}",
+            plan.order
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn declared_deps_add_to_foreign_keys() -> Result<()> {
+        let keys = [key(
+            "orders_user_fk",
+            "orders",
+            &["user_id"],
+            "users",
+            &["id"],
+        )];
+        let yaml = format!("{ORDERS}    deps:\n      created_by: staff.id\n");
+        let plan = plan_with(&yaml, &keys)?;
+
+        assert_eq!(
+            pulls_of(&plan, "users"),
+            ["pulled in by foreign key orders_user_fk"]
+        );
+        assert_eq!(pulls_of(&plan, "staff"), ["pulled in by orders.created_by"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_dep_that_agrees_with_a_foreign_key_pulls_once() -> Result<()> {
+        let keys = [key(
+            "orders_user_fk",
+            "orders",
+            &["user_id"],
+            "users",
+            &["id"],
+        )];
+        let yaml = format!("{ORDERS}    deps:\n      user_id: users.id\n");
+        let plan = plan_with(&yaml, &keys)?;
+
+        assert_eq!(
+            pulls_of(&plan, "users"),
+            ["pulled in by orders.user_id"],
+            "the declared dep and the key are the same reference"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_dep_that_disagrees_with_a_foreign_key_is_an_error() {
+        let keys = [key(
+            "orders_user_fk",
+            "orders",
+            &["user_id"],
+            "users",
+            &["id"],
+        )];
+        let yaml = format!("{ORDERS}    deps:\n      user_id: accounts.id\n");
+        let error = plan_with(&yaml, &keys).expect_err("the dep and the key disagree");
+        assert_eq!(
+            error.to_string(),
+            "config sampler #1 (orders): orders.user_id points at accounts.id, but foreign key \
+             orders_user_fk says it points at users.id"
+        );
+    }
+
+    #[test]
+    fn a_composite_foreign_key_is_a_composite_dep() -> Result<()> {
+        let keys = [key(
+            "memberships_user_fk",
+            "memberships",
+            &["tenant_id", "user_id"],
+            "users",
+            &["tenant_id", "id"],
+        )];
+        let plan = plan_with(
+            "samplers:\n  - table: memberships\n    where: id < 5\n    limit: all\n",
+            &keys,
+        )?;
+
+        let pulled = &plan.samplers[plan.tables["users"].samplers[0]];
+        assert_eq!(
+            pulled.origin,
+            "pulled in by foreign key memberships_user_fk"
+        );
+        let described = plan.describe(Dialect::MySql);
+        assert!(
+            described.contains("(`tenant_id`, `id`) IN (<memberships.(tenant_id, user_id)>)"),
+            "{described}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn two_keys_on_one_column_pull_both_parents() -> Result<()> {
+        let keys = [
+            key("orders_user_fk", "orders", &["owner_id"], "users", &["id"]),
+            key(
+                "orders_account_fk",
+                "orders",
+                &["owner_id"],
+                "accounts",
+                &["id"],
+            ),
+        ];
+        let plan = plan_with(ORDERS, &keys)?;
+        assert_eq!(pulls_of(&plan, "users").len(), 1);
+        assert_eq!(pulls_of(&plan, "accounts").len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_table_that_keeps_every_row_is_not_pulled_again() -> Result<()> {
+        let keys = [key(
+            "orders_user_fk",
+            "orders",
+            &["user_id"],
+            "users",
+            &["id"],
+        )];
+        let yaml = format!("{ORDERS}  - table: users\n    limit: all\n");
+        let plan = plan_with(&yaml, &keys)?;
+        assert_eq!(pulls_of(&plan, "users").len(), 1, "only its own sampler");
+        Ok(())
+    }
+
+    #[test]
+    fn a_foreign_key_to_its_own_table_makes_a_cycle() -> Result<()> {
+        let keys = [key(
+            "manager_fk",
+            "employees",
+            &["manager_id"],
+            "employees",
+            &["id"],
+        )];
+        let plan = plan_with(
+            "samplers:\n  - table: employees\n    where: id = 40\n    limit: all\n",
+            &keys,
+        )?;
+        assert_eq!(plan.cycles, [["employees".to_string()]]);
+        Ok(())
+    }
+
+    #[test]
+    fn without_foreign_keys_the_plan_is_the_declared_one() -> Result<()> {
+        let keys = [key(
+            "orders_user_fk",
+            "orders",
+            &["user_id"],
+            "users",
+            &["id"],
+        )];
+        let with = plan_with(ORDERS, &[])?;
+        assert_eq!(with, plan(ORDERS)?, "no keys, nothing added");
+        assert_ne!(with, plan_with(ORDERS, &keys)?);
         Ok(())
     }
 

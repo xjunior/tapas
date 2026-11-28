@@ -13,7 +13,8 @@ samplers:
 A table with no sampler, or a sampler with no `limit` and no `of`, brings no rows of its own. It is extracted only
 when another table's [`deps`](#of-and-deps) point at it.
 
-A config can also say how to replace sensitive values, under `sanitize:`. See [Sanitization](sanitization.md).
+A config can also say how to replace sensitive values, under `sanitize:` (see [Sanitization](sanitization.md)), and
+where references come from, under `deps:` (see [Foreign keys](#foreign-keys)).
 
 ## Files
 
@@ -137,6 +138,32 @@ A row whose key has a NULL column points at nothing, so it brings nothing along.
 | --- | --- |
 | The rows that belong to what's in the sample | `of` on the child |
 | The rows that what's in the sample points at | `deps` on the child |
+
+## Foreign keys
+
+Most schemas already say what points at what. Set `deps: foreign_keys` at the top of a config, or pass
+[`--deps foreign-keys`](cli.md#--deps), and tapas reads the source's foreign keys and follows them like `deps`:
+
+```yaml
+deps: foreign_keys
+samplers:
+  - table: orders
+    limit: { since: created_at }   # every user, territory and so on the orders point at comes along
+```
+
+Every table the sample reaches brings what its foreign keys point at, and so on up the chain. Keys of tables the
+sample never reaches are ignored. A key over several columns works too, and so does one that points at its own table.
+
+Declared `deps` add to the foreign keys, for references the schema doesn't state, as many Rails apps don't. One that
+says the same as a key is the same reference. One that says a key's columns point at another table is an error:
+
+```
+config sampler #1 (orders): orders.user_id points at accounts.id, but foreign key orders_user_fk says it
+points at users.id
+```
+
+`deps: declared` is the default, and `--deps` overrides the config. When several files set `deps`, they must agree.
+Foreign keys need the source, so `--plan` needs `--source` too.
 
 ## Time windows
 

@@ -280,6 +280,34 @@ pub fn columns_query(dialect: Dialect, tables: &[&str]) -> Vec<u8> {
     out
 }
 
+/// Returns the query that lists the foreign keys between tables of the current database or
+/// schema, one row per column: constraint, table, column, parent table, parent column. Rows come
+/// ordered by table and constraint, and by the column's position in the key.
+#[must_use]
+pub fn foreign_keys_query(dialect: Dialect) -> &'static str {
+    match dialect {
+        Dialect::MySql => {
+            "SELECT CONSTRAINT_NAME, TABLE_NAME, COLUMN_NAME, REFERENCED_TABLE_NAME, \
+             REFERENCED_COLUMN_NAME \
+             FROM information_schema.KEY_COLUMN_USAGE \
+             WHERE TABLE_SCHEMA = DATABASE() AND REFERENCED_TABLE_SCHEMA = DATABASE() \
+             ORDER BY TABLE_NAME, CONSTRAINT_NAME, ORDINAL_POSITION"
+        }
+        Dialect::Postgres => {
+            "SELECT c.conname, t.relname, a.attname, p.relname, pa.attname \
+             FROM pg_constraint c \
+             JOIN pg_class t ON t.oid = c.conrelid \
+             JOIN pg_class p ON p.oid = c.confrelid \
+             CROSS JOIN LATERAL unnest(c.conkey, c.confkey) WITH ORDINALITY AS k(child, parent, position) \
+             JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.child \
+             JOIN pg_attribute pa ON pa.attrelid = c.confrelid AND pa.attnum = k.parent \
+             WHERE c.contype = 'f' AND t.relnamespace = current_schema()::regnamespace \
+             AND p.relnamespace = current_schema()::regnamespace \
+             ORDER BY t.relname, c.conname, k.position"
+        }
+    }
+}
+
 /// The rows a dependency allows.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Allowed {
@@ -891,6 +919,31 @@ mod tests {
              ORDER BY TABLE_NAME, ORDINAL_POSITION"
         );
         Ok(())
+    }
+
+    #[test]
+    fn lists_foreign_keys_of_the_current_database() {
+        assert_eq!(
+            foreign_keys_query(Dialect::MySql),
+            "SELECT CONSTRAINT_NAME, TABLE_NAME, COLUMN_NAME, REFERENCED_TABLE_NAME, \
+             REFERENCED_COLUMN_NAME \
+             FROM information_schema.KEY_COLUMN_USAGE \
+             WHERE TABLE_SCHEMA = DATABASE() AND REFERENCED_TABLE_SCHEMA = DATABASE() \
+             ORDER BY TABLE_NAME, CONSTRAINT_NAME, ORDINAL_POSITION"
+        );
+        assert_eq!(
+            foreign_keys_query(Dialect::Postgres),
+            "SELECT c.conname, t.relname, a.attname, p.relname, pa.attname \
+             FROM pg_constraint c \
+             JOIN pg_class t ON t.oid = c.conrelid \
+             JOIN pg_class p ON p.oid = c.confrelid \
+             CROSS JOIN LATERAL unnest(c.conkey, c.confkey) WITH ORDINALITY AS k(child, parent, position) \
+             JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.child \
+             JOIN pg_attribute pa ON pa.attrelid = c.confrelid AND pa.attnum = k.parent \
+             WHERE c.contype = 'f' AND t.relnamespace = current_schema()::regnamespace \
+             AND p.relnamespace = current_schema()::regnamespace \
+             ORDER BY t.relname, c.conname, k.position"
+        );
     }
 
     #[test]

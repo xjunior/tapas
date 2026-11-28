@@ -7,7 +7,7 @@ use mysql_async::Opts;
 
 use crate::extract::{self, Options};
 use crate::output::{Outcome, Output, Sink};
-use crate::plan::Plan;
+use crate::plan::{ForeignKey, Plan};
 use crate::postgres;
 use crate::sanitize::{Sanitizer, Seed};
 use crate::source::Source;
@@ -66,6 +66,16 @@ pub async fn run(
     // says why, so it comes first.
     written?;
     extracted
+}
+
+/// Returns the foreign keys between tables of the database at `source_url`, which
+/// [`Plan::try_new_with_foreign_keys`] turns into references.
+pub async fn foreign_keys(source_url: &str) -> Result<Vec<ForeignKey>> {
+    let dialect = dialect_of(source_url, "source")?;
+    let source = Source::try_new(dialect, source_url, 1)?;
+    let keys = source.foreign_keys().await;
+    source.disconnect().await;
+    keys
 }
 
 /// Works out what the plan's sanitize rules do to each table, from the source's columns. Reads

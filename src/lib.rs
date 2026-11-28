@@ -16,6 +16,6 @@ pub mod sql;
 pub use config::Config;
 pub use extract::Options;
 pub use output::Output;
-pub use plan::Plan;
-pub use run::run;
+pub use plan::{ForeignKey, Plan};
+pub use run::{foreign_keys, run};
 pub use since::Since;

@@ -4,8 +4,9 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::Context;
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::Parser;
+use tapas::config::DepsSource;
 use tapas::sanitize::Seed;
 use tapas::sql::Dialect;
 use tapas::{Config, Options, Output, Plan, Since};
@@ -67,10 +68,23 @@ struct Args {
     #[arg(long, env = "TAPAS_SANITIZE_SEED", hide_env_values = true)]
     sanitize_seed: Option<Seed>,
 
+    /// Where references between tables come from: `declared` takes only the config's `deps` and
+    /// `of`; `foreign-keys` also follows the source's foreign keys, which needs --source even with
+    /// --plan. Overrides the config's `deps`.
+    #[arg(long)]
+    deps: Option<DepsSource>,
+
     /// Show the values in errors, such as every row of an INSERT the target refused. Those rows
     /// are as tapas writes them, so sanitized columns hold their replacements.
     #[arg(long)]
     debug: bool,
+}
+
+/// Returns where references come from: the command line's choice, else the config's, else the
+/// declared `deps` and `of` alone.
+#[must_use]
+fn deps_source(command_line: Option<DepsSource>, config: Option<DepsSource>) -> DepsSource {
+    command_line.or(config).unwrap_or_default()
 }
 
 #[tokio::main]
@@ -78,7 +92,17 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let started = Instant::now();
 
-    let plan = Plan::try_new(Config::load(&args.configs)?, args.since)?;
+    let config = Config::load(&args.configs)?;
+    let foreign_keys = match deps_source(args.deps, config.deps) {
+        DepsSource::Declared => Vec::new(),
+        DepsSource::ForeignKeys => {
+            let Some(source) = args.source.as_deref() else {
+                bail!("--deps foreign-keys reads the foreign keys from --source; pass it");
+            };
+            tapas::foreign_keys(source).await?
+        }
+    };
+    let plan = Plan::try_new_with_foreign_keys(config, args.since, &foreign_keys)?;
     if args.plan {
         let dialect = match args.source.as_deref() {
             Some(url) => Dialect::from_url(url)
@@ -120,6 +144,33 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deps_defaults_to_what_the_config_says() -> Result<()> {
+        let args = Args::try_parse_from(["tapas", "tapas.yml", "--plan"])?;
+        assert_eq!(args.deps, None, "the config decides unless --deps is given");
+        let args =
+            Args::try_parse_from(["tapas", "tapas.yml", "--plan", "--deps", "foreign-keys"])?;
+        assert_eq!(args.deps, Some(DepsSource::ForeignKeys));
+        let error = Args::try_parse_from(["tapas", "tapas.yml", "--plan", "--deps", "keys"])
+            .expect_err("`keys` isn't a source of references");
+        assert!(
+            error
+                .to_string()
+                .contains("use `declared` or `foreign-keys`"),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_command_line_wins_over_the_config() {
+        use DepsSource::{Declared, ForeignKeys};
+        assert_eq!(deps_source(None, None), Declared);
+        assert_eq!(deps_source(None, Some(ForeignKeys)), ForeignKeys);
+        assert_eq!(deps_source(Some(Declared), Some(ForeignKeys)), Declared);
+        assert_eq!(deps_source(Some(ForeignKeys), Some(Declared)), ForeignKeys);
+    }
 
     #[test]
     fn debug_is_off_unless_asked_for() -> Result<()> {
