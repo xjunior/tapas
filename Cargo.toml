@@ -1,6 +1,6 @@
 [package]
 name = "tapas"
-version = "0.3.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.89"
 description = "Pulls a sample out of a MySQL or Postgres database into a SQL file or another database, keeping every reference intact"
