@@ -74,12 +74,14 @@ pub enum Sink {
 }
 
 impl Sink {
-    /// Opens `output` for the INSERTs into `tables`, written in `dialect`. Returns the sink and
-    /// the sender to send statements through.
+    /// Opens `output` for the INSERTs into `tables`, written in `dialect`. With `debug`, a
+    /// statement the target refuses shows in full in the error. Returns the sink and the sender
+    /// to send statements through.
     pub async fn open(
         output: &Output,
         dialect: Dialect,
         tables: &[&str],
+        debug: bool,
     ) -> Result<(Self, mpsc::Sender<Vec<u8>>)> {
         Ok(match (output, dialect) {
             (Output::File(path), Dialect::MySql | Dialect::Postgres) => {
@@ -87,11 +89,11 @@ impl Sink {
                 (Sink::File(file), sender)
             }
             (Output::Database(url), Dialect::MySql) => {
-                let (target, sender) = MySqlTarget::connect(url).await?;
+                let (target, sender) = MySqlTarget::connect(url, debug).await?;
                 (Sink::MySql(target), sender)
             }
             (Output::Database(url), Dialect::Postgres) => {
-                let (target, sender) = PostgresTarget::connect(url, tables).await?;
+                let (target, sender) = PostgresTarget::connect(url, tables, debug).await?;
                 (Sink::Postgres(target), sender)
             }
         })
@@ -234,8 +236,9 @@ pub struct MySqlTarget {
 
 impl MySqlTarget {
     /// Connects to the database at `url`, starts a transaction, and starts the task that runs
-    /// the statements. Returns the target and the sender to send statements through.
-    pub async fn connect(url: &str) -> Result<(Self, mpsc::Sender<Vec<u8>>)> {
+    /// the statements. With `debug`, a refused statement shows in full in the error. Returns the
+    /// target and the sender to send statements through.
+    pub async fn connect(url: &str, debug: bool) -> Result<(Self, mpsc::Sender<Vec<u8>>)> {
         let connection_options = Opts::from_url(url).context("parsing the target URL")?;
         let mut connection = Conn::new(connection_options)
             .await
@@ -259,7 +262,7 @@ impl MySqlTarget {
                 connection
                     .query_drop(statement.as_slice())
                     .await
-                    .with_context(|| format!("running {}", statement_head(&statement)))?;
+                    .with_context(|| format!("running {}", refused(&statement, debug)))?;
             }
             Ok(connection)
         });
@@ -305,8 +308,13 @@ pub struct PostgresTarget {
 
 impl PostgresTarget {
     /// Connects to the database at `url`, starts a transaction, and starts the task that runs
-    /// the INSERTs into `tables`. Returns the target and the sender to send statements through.
-    pub async fn connect(url: &str, tables: &[&str]) -> Result<(Self, mpsc::Sender<Vec<u8>>)> {
+    /// the INSERTs into `tables`. With `debug`, a refused statement shows in full in the error.
+    /// Returns the target and the sender to send statements through.
+    pub async fn connect(
+        url: &str,
+        tables: &[&str],
+        debug: bool,
+    ) -> Result<(Self, mpsc::Sender<Vec<u8>>)> {
         let config = postgres::config(url).context("parsing the target URL")?;
         let client = postgres::connect(&config)
             .await
@@ -332,7 +340,7 @@ impl PostgresTarget {
                 client
                     .batch_execute(statement)
                     .await
-                    .with_context(|| format!("running {}", statement_head(statement.as_bytes())))?;
+                    .with_context(|| format!("running {}", refused(statement.as_bytes(), debug)))?;
             }
             Ok(client)
         });
@@ -370,9 +378,13 @@ impl PostgresTarget {
     }
 }
 
-/// The first line of an INSERT statement, which names its table and columns, followed by `…`
-/// for the rows, so a refused statement can be named without printing its values.
-fn statement_head(statement: &[u8]) -> String {
+/// A refused INSERT statement, as its error shows it: in full with `debug`, or else its first
+/// line, which names its table and columns, followed by `…` for the rows, so the error holds no
+/// values.
+fn refused(statement: &[u8], debug: bool) -> String {
+    if debug {
+        return String::from_utf8_lossy(statement).trim_end().to_owned();
+    }
     let end = statement
         .iter()
         .position(|&byte| byte == b'\n')

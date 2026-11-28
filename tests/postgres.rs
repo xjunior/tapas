@@ -379,19 +379,17 @@ async fn says_why_the_target_refused_a_statement() -> Result<()> {
         .batch_execute("ALTER TABLE orders DROP COLUMN total")
         .await?;
     let config: Config = "samplers:\n  - table: orders\n".parse()?;
+    let plan = Plan::try_new(config, None)?;
+    let source_url = format!("{base}/{}", databases[0]);
+    let target = Output::Database(format!("{base}/{}", databases[1]));
+    let options = Options {
+        batch_rows: 1,
+        ..Options::default()
+    };
 
-    let error = tapas::run(
-        Plan::try_new(config, None)?,
-        &format!("{base}/{}", databases[0]),
-        2,
-        &Output::Database(format!("{base}/{}", databases[1])),
-        Options {
-            batch_rows: 1,
-            ..Options::default()
-        },
-    )
-    .await
-    .expect_err("the target has no total column");
+    let error = tapas::run(plan.clone(), &source_url, 2, &target, options)
+        .await
+        .expect_err("the target has no total column");
     let message = format!("{error:#}");
     assert!(
         message.contains(r#"INSERT INTO "orders" ("id", "user_id", "total", "placed_at")"#),
@@ -400,6 +398,23 @@ async fn says_why_the_target_refused_a_statement() -> Result<()> {
     assert!(
         message.contains(r#"column "total" of relation "orders" does not exist"#),
         "gives the target's reason: {message}"
+    );
+    assert!(
+        message.contains("VALUES …") && !message.contains("VALUES\n('"),
+        "keeps the values out without debug: {message}"
+    );
+
+    let debug = Options {
+        debug: true,
+        ..options
+    };
+    let error = tapas::run(plan, &source_url, 2, &target, debug)
+        .await
+        .expect_err("the target has no total column");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("OVERRIDING SYSTEM VALUE VALUES\n('"),
+        "shows the refused statement's values with debug: {message}"
     );
 
     drop_databases(&admin, databases).await?;

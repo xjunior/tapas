@@ -29,6 +29,9 @@ pub struct Options {
     pub batch_rows: usize,
     /// Where fake values start from. Without one, each run picks its own.
     pub sanitize_seed: Option<Seed>,
+    /// Errors show the values they're about, such as every row of a statement the target
+    /// refused. Off by default, so errors that end up in logs hold no data.
+    pub debug: bool,
 }
 
 impl Default for Options {
@@ -37,6 +40,7 @@ impl Default for Options {
             chunk_size: 5_000,
             batch_rows: 500,
             sanitize_seed: None,
+            debug: false,
         }
     }
 }

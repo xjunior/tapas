@@ -17,6 +17,7 @@ tapas [OPTIONS] <CONFIGS>...
 | `--chunk-size <N>` | `5000` | Values per `IN (...)` list. |
 | `--batch-rows <N>` | `500` | Rows per `INSERT` statement. |
 | `--sanitize-seed <TEXT>` | | Makes fake values the same from run to run. |
+| `--debug` | | Shows the values in errors. |
 
 ## `--source`
 
@@ -112,6 +113,33 @@ Without it, each run picks its own seed. Within one run, fakes always line up.
 
 Treat the seed like a password, and keep it off the command line the same way: see
 [why](sanitization.md#consistent-fakes).
+
+## `--debug`
+
+Shows the values in errors. Without it, a statement the target refuses shows only its table and columns, so errors
+that end up in CI logs hold no data:
+
+```
+Error: writing to the target
+
+Caused by:
+    0: running INSERT INTO `users` (`id`, `name`) VALUES …
+    1: Server error: `ERROR 1406 (22001): Data too long for column 'name' at row 3'
+```
+
+With `--debug`, the error shows the whole statement, so you can see which row the target refused:
+
+```
+Caused by:
+    0: running INSERT INTO `users` (`id`, `name`) VALUES
+       (1, 'ana'),
+       (2, 'bo'),
+       (3, 'Maximiliana');
+    1: Server error: `ERROR 1406 (22001): Data too long for column 'name' at row 3'
+```
+
+The rows are as tapas writes them, so [sanitized](sanitization.md) columns hold their replacements. A statement holds
+up to `--batch-rows` rows; add `--batch-rows 1` to narrow the error down to one row.
 
 ## `--plan`
 

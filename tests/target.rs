@@ -115,18 +115,17 @@ async fn says_why_the_target_refused_a_statement() -> Result<()> {
         .await?;
 
     let config: Config = "samplers:\n  - table: users\n".parse()?;
-    let error = tapas::run(
-        Plan::try_new(config, None)?,
-        &format!("{base}/tapas_refused_source"),
-        2,
-        &Output::Database(format!("{base}/tapas_refused_target")),
-        Options {
-            batch_rows: 1,
-            ..Options::default()
-        },
-    )
-    .await
-    .expect_err("the target has no name column");
+    let plan = Plan::try_new(config, None)?;
+    let source_url = format!("{base}/tapas_refused_source");
+    let target = Output::Database(format!("{base}/tapas_refused_target"));
+    let options = Options {
+        batch_rows: 1,
+        ..Options::default()
+    };
+
+    let error = tapas::run(plan.clone(), &source_url, 2, &target, options)
+        .await
+        .expect_err("the target has no name column");
     let message = format!("{error:#}");
     assert!(
         message.contains("INSERT INTO `users` (`id`, `name`) VALUES"),
@@ -135,6 +134,23 @@ async fn says_why_the_target_refused_a_statement() -> Result<()> {
     assert!(
         message.contains("Unknown column 'name'"),
         "gives the target's reason: {message}"
+    );
+    assert!(
+        !message.contains("'ana'"),
+        "keeps the values out without debug: {message}"
+    );
+
+    let debug = Options {
+        debug: true,
+        ..options
+    };
+    let error = tapas::run(plan, &source_url, 2, &target, debug)
+        .await
+        .expect_err("the target has no name column");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains(", 'ana');"),
+        "shows the refused statement's values with debug: {message}"
     );
 
     connection

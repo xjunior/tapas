@@ -66,6 +66,11 @@ struct Args {
     /// the same fake one in every run; keep it secret. Without it, each run picks its own.
     #[arg(long, env = "TAPAS_SANITIZE_SEED", hide_env_values = true)]
     sanitize_seed: Option<Seed>,
+
+    /// Show the values in errors, such as every row of an INSERT the target refused. Those rows
+    /// are as tapas writes them, so sanitized columns hold their replacements.
+    #[arg(long)]
+    debug: bool,
 }
 
 #[tokio::main]
@@ -96,6 +101,7 @@ async fn main() -> Result<()> {
         chunk_size: args.chunk_size.max(1),
         batch_rows: args.batch_rows.max(1),
         sanitize_seed: args.sanitize_seed,
+        debug: args.debug,
     };
     let rows = tapas::run(plan, &source, args.connections, &output, options).await?;
 
@@ -109,4 +115,18 @@ async fn main() -> Result<()> {
         started.elapsed().as_secs_f64()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_is_off_unless_asked_for() -> Result<()> {
+        let args = Args::try_parse_from(["tapas", "tapas.yml", "--plan"])?;
+        assert!(!args.debug, "errors keep values out by default");
+        let args = Args::try_parse_from(["tapas", "tapas.yml", "--plan", "--debug"])?;
+        assert!(args.debug, "--debug turns it on");
+        Ok(())
+    }
 }
