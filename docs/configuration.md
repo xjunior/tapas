@@ -227,6 +227,99 @@ tapas extracts a cycle in rounds until a round finds nothing new. A sampler that
 `limit: all` and `since` work, `limit: 100` doesn't.
 `--plan` shows each cycle and marks the samplers that run in rounds.
 
+## Everything in one file
+
+Every option, in one config. A real one uses a fraction of these:
+
+```yaml
+# tapas tapas.yml --since '2 weeks' --plan
+
+# Follow the source's foreign keys as well as the `deps` below. This is the default; `false` follows only what
+# you declare. Several files may set it, but they must agree.
+foreign_keys: true
+
+samplers:
+  # `limit: all` takes every row that matches `where`, or every row without one.
+  - table: countries
+    limit: all
+
+  # A row count, with `order_by` choosing which rows. `deps` brings along the rows these point at.
+  - table: users
+    order_by: id DESC
+    limit: 100
+    deps:
+      country_id: countries.id
+
+  # Another sampler of the same table adds its rows. A row picked twice is written once.
+  - table: users
+    where: admin = 1
+    limit: all
+
+  # A time window: rows whose column is within --since. Several columns match when any one is recent enough.
+  - table: orders
+    limit: { since: created_at }
+    deps:
+      user_id: users.id
+
+  # A count and a window together: at most 1000 of the rows within --since, after `order_by`.
+  - table: events
+    order_by: id DESC
+    limit: { rows: 1000, since: [created_at, updated_at] }
+
+  # `of` takes only the rows that belong to rows already in the sample. `deps` on a table nothing samples
+  # (products) is enough to bring its rows along.
+  - table: line_items
+    of:
+      order_id: orders.id
+    deps:
+      product_id: products.id
+
+  # Several columns make one reference: a list item, every column pointing at one table. This works in `of` too.
+  - table: invoices
+    limit: { since: issued_at }
+  - table: invoice_lines
+    of:
+      - { tenant_id: invoices.tenant_id, invoice_id: invoices.id }
+  - table: payments
+    limit: { since: paid_at }
+    deps:
+      - { tenant_id: invoices.tenant_id, invoice_id: invoices.id }   # one reference...
+      - { created_by: users.id }                                      # ...and another
+
+  # A named sampler lets `of` follow just its rows: every write-off is copied, but only recent ones bring
+  # their project.
+  - table: written_off_projects
+    limit: all
+  - table: written_off_projects
+    name: recent_write_offs
+    limit: { since: [created_at, updated_at] }
+  - table: projects
+    of:
+      id: recent_write_offs.project_id
+
+  # A table that points at itself: an employee, their manager, their manager's manager, ...
+  - table: employees
+    where: id = 40
+    limit: all
+    deps:
+      manager_id: employees.id
+
+# Replace sensitive values on the way out. See Sanitization.
+sanitize:
+  columns:                                # every table; list the `keep` exceptions first
+    "*_id": keep
+    "*email*": { fake: email }
+    "*notes*": { value: Redacted }
+    "*encrypted*": null
+  tables:                                 # one table; wins over `columns`
+    users:
+      name: { fake: name }
+      login: { template: "user_{id}" }
+      recovery_email: keep
+    payments:
+      card_number: { fake: credit_card }
+```
+
 ## Writing good samplers
 
 - Start from the tables your sample is about, give them a `limit` with `since`, and follow references from there.

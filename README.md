@@ -91,7 +91,8 @@ command line too: see [Command line](docs/cli.md#connection-urls). There's a ful
 
 ## Documentation
 
-- [Configuration](docs/configuration.md): samplers, `of`, `deps`, names, time windows and cycles.
+- [Configuration](docs/configuration.md): samplers, `of`, `deps`, foreign keys, names, time windows and cycles, and
+  [one file with every option](docs/configuration.md#everything-in-one-file).
 - [Sanitization](docs/sanitization.md): replacing sensitive values with fakes, fixed values or templates.
 - [Command line](docs/cli.md): every flag, connection URLs and their environment variables, and what the output
   looks like.
