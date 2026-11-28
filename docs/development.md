@@ -49,6 +49,11 @@ cargo clippy --all-targets -- -D warnings
 
 Both must be clean; CI runs the same.
 
+## Site
+
+`site/` is the project's web page: one static file, published to GitHub Pages by `.github/workflows/pages.yml` when it changes on
+`main`. Pages needs **Settings → Pages → Source: GitHub Actions**, once. Open `site/index.html` in a browser to preview it.
+
 ## Rules
 
 Code, tests and docs follow the rules in [`.agents/rules/`](../.agents/rules): the style guide, tests first,
