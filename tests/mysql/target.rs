@@ -1,12 +1,10 @@
-//! Writes a sample straight into a target database. Needs TAPAS_TEST_DATABASE_URL, like
-//! tests/end_to_end.rs; skipped without it.
+//! Writes a sample straight into a target database.
 
-use std::env;
-
-use anyhow::{Context, Result};
+use anyhow::Result;
 use mysql_async::prelude::Queryable;
-use mysql_async::{Conn, Opts};
 use tapas::{Config, Options, Output, Plan};
+
+use super::support::{connect, scalar, url};
 
 const SCHEMA: &str = r#"
 CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR(100));
@@ -34,12 +32,11 @@ samplers:
 
 #[tokio::test(flavor = "multi_thread")]
 async fn writes_straight_into_a_target_database() -> Result<()> {
-    let Ok(base) = env::var("TAPAS_TEST_DATABASE_URL") else {
-        eprintln!("TAPAS_TEST_DATABASE_URL not set, skipping");
+    let Some(base) = url() else {
         return Ok(());
     };
 
-    let mut connection = Conn::new(Opts::from_url(&base)?).await?;
+    let mut connection = connect(&base).await?;
     for database in ["tapas_target_source", "tapas_target_target"] {
         connection.query_drop(format!(
             "DROP DATABASE IF EXISTS {database}; CREATE DATABASE {database}; USE {database}; {SCHEMA}"
@@ -77,10 +74,12 @@ async fn writes_straight_into_a_target_database() -> Result<()> {
     assert_eq!(rows["orders"], 3);
     assert_eq!(rows["users"], 2);
 
-    let count = |table: &str| format!("SELECT COUNT(*) FROM tapas_target_target.{table}");
-    for (table, expected) in [("orders", 3u64), ("users", 2)] {
-        let found: Option<u64> = connection.query_first(count(table)).await?;
-        let found = found.context("COUNT(*) returns a row")?;
+    for (table, expected) in [("orders", 3), ("users", 2)] {
+        let found = scalar(
+            &mut connection,
+            &format!("SELECT COUNT(*) FROM tapas_target_target.{table}"),
+        )
+        .await?;
         assert_eq!(found, expected, "{table}");
     }
 
@@ -93,15 +92,14 @@ async fn writes_straight_into_a_target_database() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn says_why_the_target_refused_a_statement() -> Result<()> {
-    let Ok(base) = env::var("TAPAS_TEST_DATABASE_URL") else {
-        eprintln!("TAPAS_TEST_DATABASE_URL not set, skipping");
+    let Some(base) = url() else {
         return Ok(());
     };
 
     // The target's users table lacks a column the source has, as after a migration the target
     // hasn't run. More statements than the output's channel holds make extraction still be
     // sending when the target refuses the first one.
-    let mut connection = Conn::new(Opts::from_url(&base)?).await?;
+    let mut connection = connect(&base).await?;
     connection
         .query_drop(
             "DROP DATABASE IF EXISTS tapas_refused_source; CREATE DATABASE tapas_refused_source;
@@ -163,13 +161,12 @@ async fn says_why_the_target_refused_a_statement() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn debug_shows_the_row_the_target_refused() -> Result<()> {
-    let Ok(base) = env::var("TAPAS_TEST_DATABASE_URL") else {
-        eprintln!("TAPAS_TEST_DATABASE_URL not set, skipping");
+    let Some(base) = url() else {
         return Ok(());
     };
 
     // One name is too long for the target, and all four rows go in one statement.
-    let mut connection = Conn::new(Opts::from_url(&base)?).await?;
+    let mut connection = connect(&base).await?;
     connection
         .query_drop(
             "DROP DATABASE IF EXISTS tapas_row_source; CREATE DATABASE tapas_row_source;

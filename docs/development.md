@@ -14,8 +14,9 @@ The binary lands in `target/release/tapas`. tapas needs Rust 1.89 or newer.
 cargo test
 ```
 
-The unit tests need nothing else. The end-to-end tests need a MySQL server and a Postgres server they can create
-databases and roles on. Each kind skips itself when its URL isn't set:
+The unit tests need nothing else. The integration tests need a MySQL server and a Postgres server they can create
+databases and roles on. Each kind skips itself when its URL isn't set, unless `CI` is set: there a missing URL fails
+the run, so a broken setup can't pass for a green one.
 
 ```sh
 docker run -d --name tapas-mysql -e MYSQL_ROOT_PASSWORD=tapas -p 3399:3306 mysql:8.4
@@ -25,20 +26,35 @@ TAPAS_TEST_DATABASE_URL=mysql://root:tapas@127.0.0.1:3399 \
 docker rm -f tapas-mysql tapas-postgres
 ```
 
+The integration tests live in two binaries, `tests/mysql` and `tests/postgres`, so CI can run each against its own
+database. `tests/mysql/support.rs` holds what the MySQL tests share: sampling a seeded database into an empty one,
+and a few queries.
+
 | Test | Covers |
 | --- | --- |
-| `tests/end_to_end.rs` | Several samplers per table, limits across chunks, `--since`, and values that make the trip unchanged. |
-| `tests/references.rs` | `deps` pulling in the rows it points at, whatever the parent's own filters. |
-| `tests/foreign_keys.rs` | Reading foreign keys, following them like the `deps` that say the same, and turning them off with `--disable-foreign-keys` and `foreign_keys: false`. |
-| `tests/composite.rs` | `of` and `deps` over several columns, where a user's id alone doesn't say which user it is. |
-| `tests/reach.rs` | `limit` with `rows` and `since` together, and tables that only `deps` pull in. |
-| `tests/target.rs` | Writing straight into a target database, refusing to write into the source, and what errors show of a refused statement. |
-| `tests/errors.rs` | What errors show of a failed source query, with and without `--debug`. |
-| `tests/cycles.rs` | A table that follows itself, two tables that follow each other, and named samplers. |
-| `tests/sanitize.rs` | Every kind of replacement, fakes that agree across tables and runs, and refusing rules that break references. |
-| `tests/postgres.rs` | Postgres: values of many types that make the trip unchanged, cycles, sequences, sanitizing, composite references, foreign keys, and what a target user needs. |
+| `mysql/end_to_end.rs` | Several samplers per table, limits across chunks, `--since`, and values that make the trip unchanged. |
+| `mysql/references.rs` | `deps` pulling in the rows it points at, whatever the parent's own filters. |
+| `mysql/foreign_keys.rs` | Reading foreign keys, following them like the `deps` that say the same, and turning them off with `--disable-foreign-keys` and `foreign_keys: false`. |
+| `mysql/composite.rs` | `of` and `deps` over several columns, where a user's id alone doesn't say which user it is. |
+| `mysql/reach.rs` | `limit` with `rows` and `since` together, and tables that only `deps` pull in. |
+| `mysql/target.rs` | Writing straight into a target database, refusing to write into the source, and what errors show of a refused statement. |
+| `mysql/errors.rs` | What errors show of a failed source query, with and without `--debug`. |
+| `mysql/cycles.rs` | A table that follows itself, two tables that follow each other, and named samplers. |
+| `mysql/sanitize.rs` | Every kind of replacement, fakes that agree across tables and runs, and refusing rules that break references. |
+| `postgres/main.rs` | Postgres: values of many types that make the trip unchanged, cycles, sequences, composite references, foreign keys, and what a target user needs. |
 
 Each one creates its own databases and drops them when it passes.
+
+### In CI
+
+One job compiles every test with [cargo-nextest](https://nexte.st) and archives the binaries. Then three jobs run
+that archive at the same time: `unit` (no database), `mysql` and `postgres`, each with only the service it needs. To
+run one the same way locally:
+
+```sh
+cargo nextest archive --archive-file tests.tar.zst
+cargo nextest run --archive-file tests.tar.zst --workspace-remap . -E 'binary(mysql)'
+```
 
 ## Lint
 
@@ -48,6 +64,11 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 Both must be clean; CI runs the same.
+
+## Site
+
+`site/` is the project's web page: one static file, published to GitHub Pages by `.github/workflows/pages.yml` when it changes on
+`main`. Pages needs **Settings → Pages → Source: GitHub Actions**, once. Open `site/index.html` in a browser to preview it.
 
 ## Rules
 

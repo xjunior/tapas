@@ -2,19 +2,36 @@
 
 Small plates of your production data.
 
-tapas pulls a sample out of a MySQL or Postgres database and writes it to a SQL file or straight into another database
-of the same kind, keeping every reference intact. You describe
-what to take in YAML; tapas works out the order, runs everything it can in parallel, and makes sure no row points at
-one that was left behind.
+[![CI](https://github.com/xjunior/tapas/actions/workflows/ci.yml/badge.svg)](https://github.com/xjunior/tapas/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/xjunior/tapas)](https://github.com/xjunior/tapas/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-- **Samplers.** Pick rows per table with plain SQL, a time window, a limit, or by following other tables.
-- **References that hold.** `deps` brings along every row your rows point at, and tapas follows the foreign keys on
-  its own. `of` takes the rows that belong to what's already in the sample.
+Every team ends up wanting the same thing: a database that feels like production, without being production. A full
+dump is too big, `LIMIT 1000` leaves orders pointing at users who aren't there, and the hand-rolled script someone wrote
+two years ago stopped working at the third migration.
+
+tapas takes a **sample** of a MySQL or Postgres database and writes it to a SQL file, or straight into another database
+of the same kind. You describe what you want in a bit of YAML. tapas works out the order, runs what it can in parallel,
+and makes sure no row points at one that got left behind.
+
+```sh
+brew install xjunior/tap/tapas
+tapas tapas.yml --since '2 weeks' --source mysql://user:password@host/shop -o sample.sql
+```
+
+## What you get
+
+- **Samplers that say what to take.** Plain SQL, a time window, a row limit, or "whatever belongs to the rows I
+  already have".
+- **References that hold.** `deps` pulls in every row your rows point at, and `of` takes the rows that belong to
+  what's already in the sample. tapas also reads the source's foreign keys, so you only write the links the schema
+  doesn't state.
 - **One config, many sizes.** `--since '2 weeks'` for a laptop, `--since '3 months'` for a review environment.
-- **No personal data.** Replace emails, names, SSNs and more with fakes that look real. The same email gets the same
-  fake everywhere it appears, so data that matched still matches.
-- **Fast.** Independent tables, samplers and chunks all run at once, over a pool of read-only connections.
-- **Look before you leap.** `--plan` prints every query without touching the database.
+- **No personal data.** Swap emails, names, SSNs and more for fakes that look real. The same email gets the same fake
+  everywhere it appears, so data that matched still matches.
+- **Fast.** Independent tables, samplers and chunks run at once over a pool of read-only connections, streaming rows
+  instead of loading them.
+- **No surprises.** `--plan` prints every query without touching the database.
 
 ## Install
 
@@ -24,10 +41,10 @@ With Homebrew, on macOS or Linux:
 brew install xjunior/tap/tapas
 ```
 
-Or download the build for your platform from the [releases](https://github.com/xjunior/tapas/releases): Linux
-(x86_64 and arm64, static) or macOS (Apple silicon and Intel). Each comes with a SHA-256 checksum.
+Or grab the build for your platform from the [releases](https://github.com/xjunior/tapas/releases): Linux (x86_64 and
+arm64, static) or macOS (Apple silicon and Intel). Each one comes with a SHA-256 checksum.
 
-Or build it yourself with Rust 1.89 or newer:
+Or build it yourself, with Rust 1.89 or newer:
 
 ```sh
 cargo install --git https://github.com/xjunior/tapas
@@ -35,7 +52,7 @@ cargo install --git https://github.com/xjunior/tapas
 
 ## Quick start
 
-Describe the sample:
+Say what you want:
 
 ```yaml
 # tapas.yml
@@ -59,7 +76,7 @@ samplers:
       order_id: orders.id         # the items of those orders
 ```
 
-Check it, run it, load it:
+Have a look at the plan first, then run it and load the result:
 
 ```sh
 tapas tapas.yml --since '2 weeks' --plan
@@ -75,32 +92,41 @@ tapas tapas.yml --since '2 weeks' \
   --target mysql://root@localhost:3306/shop_dev
 ```
 
-Postgres works the same way, with `postgres://` URLs:
+Postgres works the same way with `postgres://` URLs:
 
 ```sh
 tapas tapas.yml --since '2 weeks' --source postgres://user:password@host:5432/shop -o sample.sql
 psql shop_dev -f sample.sql
 ```
 
-tapas also follows the source's foreign keys, so you only write the `deps` the schema doesn't state. To follow just
-the ones you write, add `foreign_keys: false` to the config or pass `--disable-foreign-keys`.
+A few things worth knowing up front:
 
-Either way tapas writes `INSERT` statements only, so the target needs the schema already. Passwords can stay off the
-command line too: see [Command line](docs/cli.md#connection-urls). There's a fuller example in
-[tapas.example.yml](tapas.example.yml).
+- tapas writes `INSERT` statements only, so the target needs its schema already.
+- Source and target must be the same kind of database.
+- Foreign keys are followed by default. To follow only the `deps` you wrote, add `foreign_keys: false` to the config
+  or pass `--disable-foreign-keys`.
+- Passwords can stay off the command line: see [Command line](docs/cli.md#connection-urls).
+
+There's a fuller config in [tapas.example.yml](tapas.example.yml).
 
 ## Documentation
 
-- [Configuration](docs/configuration.md): samplers, `of`, `deps`, foreign keys, names, time windows and cycles, and
+- [Configuration](docs/configuration.md): samplers, `of`, `deps`, foreign keys, names, time windows and cycles, plus
   [one file with every option](docs/configuration.md#everything-in-one-file).
 - [Sanitization](docs/sanitization.md): replacing sensitive values with fakes, fixed values or templates.
 - [Command line](docs/cli.md): every flag, connection URLs and their environment variables, and what the output
   looks like.
 - [How it works](docs/how-it-works.md): planning, scheduling and cycles, for people changing tapas.
 - [Limitations](docs/limitations.md): what tapas doesn't do yet.
-- [Development](docs/development.md): building and testing.
+- [Development](docs/development.md): building, testing and releasing.
 
-See [CHANGELOG.md](CHANGELOG.md) for what changed in each version.
+What changed in each version lives in [CHANGELOG.md](CHANGELOG.md).
+
+## Contributing
+
+Issues and pull requests are welcome. [Development](docs/development.md) covers building, running the tests (you'll
+need a MySQL and a Postgres, and Docker makes that a one-liner) and how commits become releases. The rules we write
+code by are in [`.agents/rules/`](.agents/rules).
 
 ## License
 

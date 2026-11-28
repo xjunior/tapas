@@ -23,7 +23,37 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
 
-  test:
+  # Compiles every test once. The jobs below run what it archived, so nothing builds twice.
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - run: cargo nextest archive --locked --archive-file tests.tar.zst
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tests
+          path: tests.tar.zst
+          retention-days: 1
+
+  # Everything that needs no database.
+  unit:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@nextest
+      - uses: actions/download-artifact@v4
+        with:
+          name: tests
+      - run: >-
+          cargo nextest run --archive-file tests.tar.zst --workspace-remap .
+          -E 'not (binary(mysql) | binary(postgres))'
+
+  mysql:
+    needs: build
     runs-on: ubuntu-24.04
     services:
       mysql:
@@ -37,6 +67,20 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
+    env:
+      TAPAS_TEST_DATABASE_URL: mysql://root:tapas@127.0.0.1:3306
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@nextest
+      - uses: actions/download-artifact@v4
+        with:
+          name: tests
+      - run: cargo nextest run --archive-file tests.tar.zst --workspace-remap . -E 'binary(mysql)'
+
+  postgres:
+    needs: build
+    runs-on: ubuntu-24.04
+    services:
       postgres:
         image: postgres:18
         env:
@@ -49,13 +93,14 @@ jobs:
           --health-timeout 5s
           --health-retries 20
     env:
-      TAPAS_TEST_DATABASE_URL: mysql://root:tapas@127.0.0.1:3306
       TAPAS_TEST_POSTGRES_URL: postgres://postgres:tapas@127.0.0.1:5432
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked
+      - uses: taiki-e/install-action@nextest
+      - uses: actions/download-artifact@v4
+        with:
+          name: tests
+      - run: cargo nextest run --archive-file tests.tar.zst --workspace-remap . -E 'binary(postgres)'
 
   # The oldest Rust that Cargo.toml promises.
   msrv:
