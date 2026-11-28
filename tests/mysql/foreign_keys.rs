@@ -1,13 +1,13 @@
-//! Following the source's foreign keys instead of declared `deps`. The database tests need
-//! TAPAS_TEST_DATABASE_URL, like end_to_end.rs.
+//! Following the source's foreign keys instead of declared `deps`.
 
 use std::process::Command;
 use std::{env, fs, process};
 
 use anyhow::Result;
 use mysql_async::prelude::Queryable;
-use mysql_async::{Conn, Opts};
 use tapas::{Config, Options, Output, Plan};
+
+use super::support::{connect, recreate, url};
 
 // Every tenant has users 1 and 2, and a manager is a user of the same tenant.
 const SCHEMA: &str = r#"
@@ -66,24 +66,15 @@ struct Rows {
     territories: Vec<u64>,
 }
 
-async fn recreate(connection: &mut Conn, database: &str) -> Result<()> {
-    connection
-        .query_drop(format!(
-            "DROP DATABASE IF EXISTS {database}; CREATE DATABASE {database}"
-        ))
-        .await?;
-    Ok(())
-}
-
 /// Extracts a sample of the seeded database with `samplers` into an empty copy, and returns what
 /// landed there.
 async fn sample(name: &str, samplers: &str, refs: Refs) -> Result<Rows> {
-    let base = env::var("TAPAS_TEST_DATABASE_URL")?;
+    let base = url().expect("callers checked the URL");
     let (source, target) = (
         format!("tapas_{name}_source"),
         format!("tapas_{name}_target"),
     );
-    let mut connection = Conn::new(Opts::from_url(&base)?).await?;
+    let mut connection = connect(&base).await?;
     recreate(&mut connection, &source).await?;
     recreate(&mut connection, &target).await?;
     connection
@@ -137,17 +128,9 @@ async fn sample(name: &str, samplers: &str, refs: Refs) -> Result<Rows> {
     Ok(rows)
 }
 
-fn database_url() -> Option<String> {
-    let url = env::var("TAPAS_TEST_DATABASE_URL").ok();
-    if url.is_none() {
-        eprintln!("TAPAS_TEST_DATABASE_URL not set, skipping");
-    }
-    url
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn follows_foreign_keys_like_the_deps_that_say_the_same() -> Result<()> {
-    if database_url().is_none() {
+    if url().is_none() {
         return Ok(());
     }
     let followed = sample("fk_followed", ORDERS, Refs::ForeignKeys).await?;
@@ -173,7 +156,7 @@ async fn follows_foreign_keys_like_the_deps_that_say_the_same() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn without_foreign_keys_nothing_is_followed() -> Result<()> {
-    if database_url().is_none() {
+    if url().is_none() {
         return Ok(());
     }
     let declared_only = sample("fk_off", ORDERS, Refs::Declared).await?;
@@ -184,11 +167,11 @@ async fn without_foreign_keys_nothing_is_followed() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn reads_every_foreign_key_of_the_database() -> Result<()> {
-    let Some(base) = database_url() else {
+    let Some(base) = url() else {
         return Ok(());
     };
     let database = "tapas_fk_keys";
-    let mut connection = Conn::new(Opts::from_url(&base)?).await?;
+    let mut connection = connect(&base).await?;
     recreate(&mut connection, database).await?;
     connection
         .query_drop(format!("USE {database}; {SCHEMA}"))
@@ -224,7 +207,11 @@ async fn reads_every_foreign_key_of_the_database() -> Result<()> {
 fn plan_of(name: &str, config: &str, args: &[&str]) -> Result<String> {
     let path = env::temp_dir().join(format!("tapas-{name}-{}.yml", process::id()));
     fs::write(&path, config)?;
-    let output = Command::new(env!("CARGO_BIN_EXE_tapas"))
+    // nextest sets the variable to wherever it unpacked the binary; `env!` is the path where
+    // the tests were built, which is gone when they run from an archive on another machine.
+    let binary =
+        env::var("CARGO_BIN_EXE_tapas").unwrap_or_else(|_| env!("CARGO_BIN_EXE_tapas").to_string());
+    let output = Command::new(binary)
         .arg(&path)
         .arg("--plan")
         .args(args)
@@ -256,11 +243,11 @@ fn a_plan_without_a_source_says_it_did_not_read_the_foreign_keys() -> Result<()>
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_plan_follows_foreign_keys_unless_disabled() -> Result<()> {
-    let Some(base) = database_url() else {
+    let Some(base) = url() else {
         return Ok(());
     };
     let database = "tapas_fk_plan";
-    let mut connection = Conn::new(Opts::from_url(&base)?).await?;
+    let mut connection = connect(&base).await?;
     recreate(&mut connection, database).await?;
     connection
         .query_drop(format!("USE {database}; {SCHEMA}"))

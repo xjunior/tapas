@@ -1,14 +1,14 @@
-//! Sanitizes a sample on its way out. Needs TAPAS_TEST_DATABASE_URL, like tests/end_to_end.rs;
-//! skipped without it.
+//! Sanitizes a sample on its way out.
 
 use std::path::{Path, PathBuf};
 use std::{env, fs, process};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use mysql_async::prelude::Queryable;
-use mysql_async::{Conn, Opts};
 use tapas::sanitize::Seed;
 use tapas::{Config, Options, Output, Plan};
+
+use super::support::{connect, scalar, url};
 
 const SCHEMA: &str = r#"
 CREATE TABLE users (
@@ -61,11 +61,6 @@ sanitize:
       nickname: keep
 "#;
 
-async fn scalar(connection: &mut Conn, query: &str) -> Result<u64> {
-    let value: Option<u64> = connection.query_first(query).await?;
-    value.with_context(|| format!("`{query}` returned no rows"))
-}
-
 fn temp_file(name: &str) -> PathBuf {
     env::temp_dir().join(format!("tapas-sanitize-{name}-{}.sql", process::id()))
 }
@@ -100,12 +95,11 @@ fn statements(path: &Path) -> Result<Vec<String>> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sanitizes_values_consistently() -> Result<()> {
-    let Ok(base) = env::var("TAPAS_TEST_DATABASE_URL") else {
-        eprintln!("TAPAS_TEST_DATABASE_URL not set, skipping");
+    let Some(base) = url() else {
         return Ok(());
     };
 
-    let mut connection = Conn::new(Opts::from_url(&base)?).await?;
+    let mut connection = connect(&base).await?;
     for database in ["tapas_sanitize_source", "tapas_sanitize_target"] {
         connection
             .query_drop(format!(

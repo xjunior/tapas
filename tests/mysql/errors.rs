@@ -1,12 +1,13 @@
-//! What errors say about the source's queries, with and without `debug`. Needs
-//! TAPAS_TEST_DATABASE_URL, like tests/end_to_end.rs; skipped without it.
+//! What errors say about the source's queries, with and without `debug`.
 
 use std::{env, process};
 
 use anyhow::Result;
+use mysql_async::Conn;
 use mysql_async::prelude::Queryable;
-use mysql_async::{Conn, Opts};
 use tapas::{Config, Options, Output, Plan};
+
+use super::support::{connect, url};
 
 const SCHEMA: &str = "
 CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR(100));
@@ -17,7 +18,7 @@ INSERT INTO phones VALUES (10, 1), (20, 2), (30, 3);
 
 /// Creates the database `name` with `SCHEMA`.
 async fn create_database(base: &str, name: &str) -> Result<Conn> {
-    let mut connection = Conn::new(Opts::from_url(base)?).await?;
+    let mut connection = connect(base).await?;
     connection
         .query_drop(format!(
             "DROP DATABASE IF EXISTS {name}; CREATE DATABASE {name}; USE {name}; {SCHEMA}"
@@ -48,8 +49,7 @@ async fn error_of(base: &str, name: &str, samplers: &str, debug: bool) -> Result
 
 #[tokio::test(flavor = "multi_thread")]
 async fn shows_the_values_of_a_failed_query_only_with_debug() -> Result<()> {
-    let Ok(base) = env::var("TAPAS_TEST_DATABASE_URL") else {
-        eprintln!("TAPAS_TEST_DATABASE_URL not set, skipping");
+    let Some(base) = url() else {
         return Ok(());
     };
     let name = "tapas_errors_values";
@@ -92,8 +92,7 @@ samplers:
 
 #[tokio::test(flavor = "multi_thread")]
 async fn names_the_query_that_failed_partway_through() -> Result<()> {
-    let Ok(base) = env::var("TAPAS_TEST_DATABASE_URL") else {
-        eprintln!("TAPAS_TEST_DATABASE_URL not set, skipping");
+    let Some(base) = url() else {
         return Ok(());
     };
     let name = "tapas_errors_stream";
