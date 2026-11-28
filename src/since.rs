@@ -1,11 +1,11 @@
-//! The `--since` span: how far back samplers with a `time_column` reach.
+//! The `--since` span: how far back samplers with a `limit.since` reach.
 
 use std::fmt::{self, Display, Formatter};
 use std::str::FromStr;
 
 use crate::sql::{self, Dialect};
 
-/// How far back samplers with a `time_column` reach: `--since '3 months'`, or `--since ever`.
+/// How far back samplers with a `limit.since` reach: `--since '3 months'`, or `--since ever`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Since {
     /// Every row is kept, however old.
@@ -179,11 +179,11 @@ mod tests {
         let since: Since = "2 weeks".parse()?;
         assert!(
             since.narrows(&["created_at".to_string()]),
-            "a span narrows a sampler with a time_column"
+            "a span narrows a sampler with a limit since"
         );
         assert!(
             !since.narrows(&[]),
-            "a sampler without a time_column keeps every row"
+            "a sampler without a since keeps every row"
         );
         assert!(
             !Since::Ever.narrows(&["created_at".to_string()]),

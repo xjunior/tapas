@@ -45,6 +45,7 @@ INSERT INTO orders
 const SAMPLERS: &str = r#"
 samplers:
   - table: orders
+    limit: all
     deps:
       user_id: users.id
 sanitize:

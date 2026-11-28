@@ -26,6 +26,7 @@ INSERT INTO orders VALUES (10, 1), (20, 2), (30, 3), (31, 3);
 const SAMPLERS: &str = r#"
 samplers:
   - table: orders
+    limit: all
     where: user_id >= 2
     deps:
       user_id: users.id
@@ -114,7 +115,7 @@ async fn says_why_the_target_refused_a_statement() -> Result<()> {
         )
         .await?;
 
-    let config: Config = "samplers:\n  - table: users\n".parse()?;
+    let config: Config = "samplers:\n  - table: users\n    limit: all\n".parse()?;
     let plan = Plan::try_new(config, None)?;
     let source_url = format!("{base}/tapas_refused_source");
     let target = Output::Database(format!("{base}/tapas_refused_target"));
@@ -180,7 +181,7 @@ async fn debug_shows_the_row_the_target_refused() -> Result<()> {
         )
         .await?;
 
-    let config: Config = "samplers:\n  - table: users\n".parse()?;
+    let config: Config = "samplers:\n  - table: users\n    limit: all\n".parse()?;
     let error = tapas::run(
         Plan::try_new(config, None)?,
         &format!("{base}/tapas_row_source"),

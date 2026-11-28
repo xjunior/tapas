@@ -29,6 +29,7 @@ docker rm -f tapas-mysql tapas-postgres
 | --- | --- |
 | `tests/end_to_end.rs` | Several samplers per table, limits across chunks, `--since`, and values that make the trip unchanged. |
 | `tests/references.rs` | `deps` pulling in the rows it points at, whatever the parent's own filters. |
+| `tests/reach.rs` | `limit` with `rows` and `since` together, and tables that only `deps` pull in. |
 | `tests/target.rs` | Writing straight into a target database, refusing to write into the source, and what errors show of a refused statement. |
 | `tests/errors.rs` | What errors show of a failed source query, with and without `--debug`. |
 | `tests/cycles.rs` | A table that follows itself, two tables that follow each other, and named samplers. |
@@ -75,8 +76,10 @@ the wall time and the maximum resident size:
 samplers:
   - table: users
     where: id % 2 = 0
+    limit: all
   - table: users
     where: id % 3 = 0
+    limit: all
   - table: orders
     of:
       user_id: users.id

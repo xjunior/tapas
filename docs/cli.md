@@ -11,7 +11,7 @@ tapas [OPTIONS] <CONFIGS>...
 | `--source <URL>` | | The database to read. Required unless `--plan`. |
 | `-o`, `--output <FILE>` | | The SQL file to write, gzipped if `<FILE>` ends in `.gz`. This or `--target`, unless `--plan`. |
 | `--target <URL>` | | The database to write into. This or `--output`, unless `--plan`. |
-| `--since <SPAN>` | | How far back samplers with a `time_column` reach. |
+| `--since <SPAN>` | | How far back samplers with a `since` limit reach. |
 | `--plan` | | Print the plan and stop, without connecting. |
 | `--connections <N>` | `8` | The most connections open to the source at once. |
 | `--chunk-size <N>` | `5000` | Values per `IN (...)` list. |
@@ -96,7 +96,7 @@ A span of days, weeks, months or years, counted back from midnight today:
 --since ever          # keep every row
 ```
 
-As soon as any sampler has a `time_column`, `--since` is required, so a forgotten flag never copies whole tables. Use
+As soon as any sampler has a `limit` with `since`, `--since` is required, so a forgotten flag never copies whole tables. Use
 `--since ever` when you do want everything.
 
 ## `--sanitize-seed`
@@ -155,7 +155,7 @@ writes the queries for the kind of database `--source` names, or for MySQL witho
 
 ```
 $ tapas tapas.example.yml --since '2 weeks' --plan
-5 tables, 7 samplers, 1 with a time_column
+5 tables, 7 samplers, 1 with a since
 --since 2 weeks: limits 1 samplers
 sanitize: 1 rules for every table, from tapas.example.yml
 

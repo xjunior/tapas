@@ -29,6 +29,7 @@ INSERT INTO orders VALUES
 const SAMPLERS: &str = r#"
 samplers:
   - table: users
+    limit: all
     deps:
       territory_id: territories.id
     where: age > 25
@@ -36,9 +37,10 @@ samplers:
   - table: orders
     deps:
       user_id: users.id
-    time_column: created_at
+    limit: { since: created_at }
 
   - table: territories
+    limit: all
 "#;
 
 async fn ids(connection: &mut Conn, table: &str) -> Result<Vec<u64>> {

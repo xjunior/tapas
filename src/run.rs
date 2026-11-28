@@ -176,7 +176,10 @@ mod tests {
 
     #[tokio::test]
     async fn refuses_urls_it_cannot_read_or_write() -> anyhow::Result<()> {
-        let plan = Plan::try_new("samplers:\n  - table: users\n".parse()?, None)?;
+        let plan = Plan::try_new(
+            "samplers:\n  - table: users\n    limit: all\n".parse()?,
+            None,
+        )?;
         let refusal = |source: &'static str, output: Output| {
             let plan = plan.clone();
             async move {

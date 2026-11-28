@@ -37,6 +37,7 @@ const SAMPLERS: &str = r#"
 samplers:
   # Employee 40, and the manager each employee points at, all the way up.
   - table: employees
+    limit: all
     where: id = 40
     deps:
       manager_id: employees.id
@@ -44,9 +45,9 @@ samplers:
   # Recently touched projects and tasks, the projects those tasks point at, and every task of
   # the projects in the sample.
   - table: projects
-    time_column: updated_at
+    limit: { since: updated_at }
   - table: project_tasks
-    time_column: updated_at
+    limit: { since: updated_at }
     deps:
       project_id: projects.id
   - table: project_tasks
@@ -55,9 +56,10 @@ samplers:
 
   # Every write-off, but only the recent ones bring their project along.
   - table: write_offs
+    limit: all
   - table: write_offs
     name: recent_write_offs
-    time_column: updated_at
+    limit: { since: updated_at }
   - table: projects
     of:
       id: recent_write_offs.project_id

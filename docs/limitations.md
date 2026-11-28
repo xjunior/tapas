@@ -39,5 +39,5 @@ What tapas doesn't do yet, or does in a way worth knowing about.
 
 - **No variables.** `where` is plain SQL; `--since` is the only value that changes per run.
 - **A `deps` sampler can't follow a named sampler.** Use `of` for that.
-- **A sampler that runs in rounds can't have a `limit`.**
+- **A sampler that runs in rounds can't cap its rows.** `limit: all` and `limit: { since: … }` work; `limit: 100` doesn't.
 - **Every table needs a primary key, or whole rows that differ.** Duplicates are found by hashing whole rows.

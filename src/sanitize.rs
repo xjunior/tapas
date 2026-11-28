@@ -564,7 +564,9 @@ mod tests {
     const PEOPLE: &str = r#"
 samplers:
   - table: users
+    limit: all
   - table: contacts
+    limit: all
 sanitize:
   columns:
     "*_id": keep
@@ -696,8 +698,9 @@ sanitize:
 
     #[test]
     fn reads_binary_and_numeric_values_by_what_they_hold() -> Result<()> {
-        let config =
-            plan("samplers:\n  - table: t\nsanitize:\n  columns:\n    \"*\": { fake: ssn }\n")?;
+        let config = plan(
+            "samplers:\n  - table: t\n    limit: all\nsanitize:\n  columns:\n    \"*\": { fake: ssn }\n",
+        )?;
         let columns = BTreeMap::from([(
             "t".to_string(),
             vec![number("a"), text("b", 20), text("c", 20)],
@@ -718,8 +721,9 @@ sanitize:
 
     #[test]
     fn cuts_fakes_to_fit() -> Result<()> {
-        let config =
-            plan("samplers:\n  - table: t\nsanitize:\n  columns:\n    email: { fake: email }\n")?;
+        let config = plan(
+            "samplers:\n  - table: t\n    limit: all\nsanitize:\n  columns:\n    email: { fake: email }\n",
+        )?;
         let columns = BTreeMap::from([("t".to_string(), vec![text("email", 6)])]);
         let sanitizer = Sanitizer::try_new(&config, &columns, Dialect::MySql, seed())?;
         let rows = sanitize(&sanitizer, "t", &["email"], &[&["'someone@x.com'"]])?;
@@ -747,7 +751,9 @@ sanitize:
             r#"
 samplers:
   - table: users
+    limit: all
   - table: orders
+    limit: all
     deps:
       user_email: users.email
 sanitize:
@@ -765,7 +771,8 @@ sanitize:
 
     #[test]
     fn rejects_rules_the_columns_cant_take() {
-        let users = "samplers:\n  - table: users\nsanitize:\n  tables:\n    users:\n";
+        let users =
+            "samplers:\n  - table: users\n    limit: all\nsanitize:\n  tables:\n    users:\n";
         for (rule, message) in [
             (
                 "emial: null",
@@ -810,7 +817,7 @@ sanitize:
 
     #[test]
     fn rejects_globs_from_two_files_on_one_column() -> Result<()> {
-        let mut config: Config = "samplers:\n  - table: users\n".parse()?;
+        let mut config: Config = "samplers:\n  - table: users\n    limit: all\n".parse()?;
         for (file, pattern) in [("a.yml", "*mail*"), ("b.yml", "e*")] {
             config
                 .sanitize
@@ -838,7 +845,7 @@ sanitize:
     #[test]
     fn rejects_tables_missing_from_the_source() -> Result<()> {
         let plan = plan(
-            "samplers:\n  - table: users\nsanitize:\n  tables:\n    users:\n      email: null\n",
+            "samplers:\n  - table: users\n    limit: all\nsanitize:\n  tables:\n    users:\n      email: null\n",
         )?;
         let error = Sanitizer::try_new(&plan, &BTreeMap::new(), Dialect::MySql, seed())
             .expect_err("the source has no users");
@@ -863,7 +870,7 @@ sanitize:
     #[test]
     fn writes_postgres_replacements() -> Result<()> {
         let config = plan(
-            "samplers:\n  - table: users\nsanitize:\n  columns:\n    \
+            "samplers:\n  - table: users\n    limit: all\nsanitize:\n  columns:\n    \
              login: { template: \"it's_{id}\" }\n    bio: { value: \"it's\" }\n    \
              email: { fake: email }\n",
         )?;

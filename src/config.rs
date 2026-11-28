@@ -7,7 +7,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use glob::{MatchOptions, Pattern};
 use serde::{Deserialize, Deserializer, de};
 use serde_yaml_ng::Value;
@@ -335,8 +335,9 @@ pub struct Sampler {
     pub filter: Option<String>,
     /// The SQL ordering applied before `limit`.
     pub order_by: Option<String>,
-    /// The sampler extracts at most this many rows.
-    pub limit: Option<u64>,
+    /// How far the sampler reaches. Without one it takes no rows of its own, unless `of`
+    /// narrows it to the rows that belong to its parents.
+    pub limit: Option<Limit>,
     /// `my_column: parent.column`: only rows that belong to the parent's extracted rows.
     #[serde(default)]
     pub of: BTreeMap<String, ColumnRef>,
@@ -344,41 +345,175 @@ pub struct Sampler {
     /// Applies to every row of the table, whichever sampler brought it in.
     #[serde(default)]
     pub deps: BTreeMap<String, ColumnRef>,
-    /// Columns `--since` filters on. Rows match when any of them is recent enough.
-    #[serde(default, deserialize_with = "one_or_many")]
-    pub time_column: Vec<String>,
     /// Where the sampler was defined, for messages: `users.yml sampler #2 (users)`.
     #[serde(skip)]
     pub origin: String,
 }
 
 impl Sampler {
-    /// Returns whether the sampler has no `where`, `limit` or `of`. `--since` can still narrow
-    /// one with a `time_column`; the plan decides whether it keeps every row.
+    /// Returns whether the sampler takes rows: it has a `limit`, or an `of` that picks the rows
+    /// belonging to its parents. One that doesn't only declares `deps`.
+    #[must_use]
+    pub fn takes_rows(&self) -> bool {
+        self.limit.is_some() || !self.of.is_empty()
+    }
+
+    /// Returns whether the sampler has `limit: all` and no `where` or `of`. `--since` can still
+    /// narrow one with a `since`; the plan decides whether it keeps every row.
     #[must_use]
     pub fn is_unfiltered(&self) -> bool {
-        self.filter.is_none() && self.limit.is_none() && self.of.is_empty()
+        self.filter.is_none()
+            && self.of.is_empty()
+            && self
+                .limit
+                .as_ref()
+                .is_some_and(|limit| limit.rows == Rows::All)
+    }
+
+    /// Returns the most rows the sampler takes, if it has a cap.
+    #[must_use]
+    pub fn row_cap(&self) -> Option<u64> {
+        match self.limit.as_ref()?.rows {
+            Rows::All => None,
+            Rows::Count(count) => Some(count),
+        }
+    }
+
+    /// Returns the columns `--since` filters on, or none when the sampler has no time window.
+    #[must_use]
+    pub fn since_columns(&self) -> &[String] {
+        self.limit.as_ref().map_or(&[], |limit| &limit.since)
+    }
+
+    /// Fails when the sampler can't take a row and has nothing to say about its `deps` either.
+    fn check_reach(&self) -> Result<()> {
+        if self.takes_rows() {
+            return Ok(());
+        }
+        if self.filter.is_some() || self.order_by.is_some() {
+            bail!(
+                "{}: `where` and `order_by` need a `limit` to apply to; write `limit: all` to take \
+                 every row that matches",
+                self.origin
+            );
+        }
+        if self.deps.is_empty() {
+            bail!(
+                "{}: takes no rows and declares no deps; write `limit: all` to copy the whole table",
+                self.origin
+            );
+        }
+        Ok(())
     }
 }
 
-fn one_or_many<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum OneOrMany {
-        One(String),
-        Many(Vec<String>),
-    }
+/// How far a sampler reaches: how many rows it takes and how recent they must be.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Limit {
+    /// The most rows to take.
+    pub rows: Rows,
+    /// Columns `--since` filters on. Rows match when any of them is recent enough. Empty means
+    /// no time window.
+    pub since: Vec<String>,
+}
 
-    let columns = match OneOrMany::deserialize(deserializer)? {
-        OneOrMany::One(column) => vec![column],
-        OneOrMany::Many(columns) => columns,
-    };
-    if columns.is_empty() || columns.iter().any(|column| column.trim().is_empty()) {
-        return Err(de::Error::custom(
-            "time_column needs at least one column name",
-        ));
+/// The row count of a [`Limit`].
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub enum Rows {
+    /// Every row.
+    #[default]
+    All,
+    /// At most this many rows.
+    Count(u64),
+}
+
+impl<'de> Deserialize<'de> for Limit {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Value::deserialize(deserializer)?
+            .try_into()
+            .map_err(de::Error::custom)
     }
-    Ok(columns)
+}
+
+impl TryFrom<Value> for Limit {
+    type Error = String;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        const EXPECTED: &str = "a limit is a number, `all`, or a map of `rows` and `since`";
+        let Value::Mapping(mapping) = value else {
+            return Rows::try_from(value)
+                .map(|rows| Self {
+                    rows,
+                    since: Vec::new(),
+                })
+                .map_err(|_| EXPECTED.to_string());
+        };
+        if mapping.is_empty() {
+            return Err(
+                "limit needs rows or since; write limit: all to take every row".to_string(),
+            );
+        }
+        let mut limit = Self::default();
+        for (key, value) in mapping {
+            match key.as_str() {
+                Some("rows") => limit.rows = Rows::try_from(value)?,
+                Some("since") => limit.since = since_columns(value)?,
+                _ => {
+                    return Err(format!(
+                        "unknown key in limit, expected `rows` or `since`: {key:?}"
+                    ));
+                }
+            }
+        }
+        Ok(limit)
+    }
+}
+
+impl TryFrom<Value> for Rows {
+    type Error = String;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::String(word) if word == "all" => Ok(Self::All),
+            Value::Number(number) => number
+                .as_u64()
+                .map(Self::Count)
+                .ok_or_else(|| "rows is a number or `all`".to_string()),
+            Value::Null
+            | Value::Bool(_)
+            | Value::String(_)
+            | Value::Sequence(_)
+            | Value::Mapping(_)
+            | Value::Tagged(_) => Err("rows is a number or `all`".to_string()),
+        }
+    }
+}
+
+/// Reads `since`: one column name, or a list of them.
+fn since_columns(value: Value) -> Result<Vec<String>, String> {
+    const EXPECTED: &str = "since needs at least one column name";
+    let names = match value {
+        Value::String(name) => vec![name],
+        Value::Sequence(names) => names
+            .into_iter()
+            .map(|name| match name {
+                Value::String(name) => Ok(name),
+                Value::Null
+                | Value::Bool(_)
+                | Value::Number(_)
+                | Value::Sequence(_)
+                | Value::Mapping(_)
+                | Value::Tagged(_) => Err(EXPECTED.to_string()),
+            })
+            .collect::<Result<Vec<String>, String>>()?,
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::Mapping(_) | Value::Tagged(_) => {
+            return Err(EXPECTED.to_string());
+        }
+    };
+    if names.is_empty() || names.iter().any(|name| name.trim().is_empty()) {
+        return Err(EXPECTED.to_string());
+    }
+    Ok(names)
 }
 
 /// A `table.column` reference to a parent's extracted rows.
@@ -435,10 +570,17 @@ impl Config {
     }
 
     fn parse_named(text: &str, name: &str) -> Result<Self> {
-        let file: File = serde_yaml_ng::from_str(text)?;
+        let file: File = serde_yaml_ng::from_str(text).map_err(|error| {
+            if error.to_string().contains("unknown field `time_column`") {
+                anyhow!("time_column moved into limit; write `limit: {{ since: created_at }}`")
+            } else {
+                error.into()
+            }
+        })?;
         let mut samplers = file.samplers;
         for (index, sampler) in samplers.iter_mut().enumerate() {
             sampler.origin = format!("{name} sampler #{} ({})", index + 1, sampler.table);
+            sampler.check_reach()?;
         }
         let sanitize = Sanitize {
             columns: file.sanitize.columns.into_rules(name),
@@ -492,11 +634,19 @@ mod tests {
 
     use super::*;
 
+    fn count(rows: u64) -> Option<Limit> {
+        Some(Limit {
+            rows: Rows::Count(rows),
+            since: Vec::new(),
+        })
+    }
+
     #[test]
     fn parses_samplers() -> Result<()> {
         let config: Config = r#"
 samplers:
   - table: countries
+    limit: all
   - table: users
     where: activated_at IS NOT NULL
     order_by: id DESC
@@ -509,14 +659,14 @@ samplers:
         assert_eq!(config.samplers.len(), 2);
         assert!(
             config.samplers[0].is_unfiltered(),
-            "countries has no filter, limit or deps: {:?}",
+            "countries has `limit: all` and no filter: {:?}",
             config.samplers[0]
         );
 
         let users = &config.samplers[1];
         assert_eq!(users.filter.as_deref(), Some("activated_at IS NOT NULL"));
         assert_eq!(users.order_by.as_deref(), Some("id DESC"));
-        assert_eq!(users.limit, Some(100));
+        assert_eq!(users.limit, count(100));
         assert_eq!(
             users.of["country_id"],
             ColumnRef {
@@ -529,40 +679,168 @@ samplers:
     }
 
     #[test]
-    fn parses_time_columns() -> Result<()> {
+    fn limit_shorthands_equal_their_maps() -> Result<()> {
         let config: Config = r#"
 samplers:
-  - table: users
-  - table: orders
-    time_column: created_at
-  - table: events
-    time_column: [created_at, updated_at]
+  - table: a
+    limit: 1000
+  - table: b
+    limit: { rows: 1000 }
+  - table: c
+    limit: all
+  - table: d
+    limit: { rows: all }
+  - table: e
+    limit: { since: created_at }
+  - table: f
+    limit: { rows: all, since: [created_at] }
 "#
         .parse()?;
 
-        assert!(
-            config.samplers[0].time_column.is_empty(),
-            "users has no time_column, yet got {:?}",
-            config.samplers[0].time_column
-        );
-        assert_eq!(config.samplers[1].time_column, ["created_at"]);
-        assert!(
-            config.samplers[1].is_unfiltered(),
-            "a time_column only filters once --since says how far back"
-        );
-        assert_eq!(config.samplers[2].time_column, ["created_at", "updated_at"]);
+        let limits: Vec<&Option<Limit>> = config.samplers.iter().map(|s| &s.limit).collect();
+        assert_eq!(limits[0], limits[1], "1000 is `{{ rows: 1000 }}`");
+        assert_eq!(limits[2], limits[3], "all is `{{ rows: all }}`");
+        assert_eq!(limits[4], limits[5], "rows defaults to all");
+        assert_eq!(config.samplers[0].row_cap(), Some(1000));
+        assert_eq!(config.samplers[2].row_cap(), None);
         Ok(())
     }
 
     #[test]
-    fn rejects_empty_time_columns() {
-        for bad in ["[]", "''", "[created_at, '']"] {
-            let yaml = format!("samplers:\n  - table: users\n    time_column: {bad}\n");
+    fn parses_since_columns() -> Result<()> {
+        let config: Config = r#"
+samplers:
+  - table: users
+    limit: all
+  - table: orders
+    limit: { since: created_at }
+  - table: events
+    limit:
+      rows: 50
+      since: [created_at, updated_at]
+"#
+        .parse()?;
+
+        assert!(
+            config.samplers[0].since_columns().is_empty(),
+            "users has no time window: {:?}",
+            config.samplers[0].limit
+        );
+        assert_eq!(config.samplers[1].since_columns(), ["created_at"]);
+        assert!(
+            config.samplers[1].is_unfiltered(),
+            "a since only filters once --since says how far back"
+        );
+        assert_eq!(
+            config.samplers[2].since_columns(),
+            ["created_at", "updated_at"]
+        );
+        assert_eq!(config.samplers[2].row_cap(), Some(50));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_bad_limits() {
+        let cases = [
+            (
+                "{}",
+                "limit needs rows or since; write limit: all to take every row",
+            ),
+            ("{ row: 100 }", "row"),
+            ("{ since: [] }", "since needs at least one column name"),
+            ("{ since: '' }", "since needs at least one column name"),
+            (
+                "{ since: [created_at, ''] }",
+                "since needs at least one column name",
+            ),
+            ("{ rows: lots }", "rows is a number or `all`"),
+            (
+                "lots",
+                "a limit is a number, `all`, or a map of `rows` and `since`",
+            ),
+            (
+                "-1",
+                "a limit is a number, `all`, or a map of `rows` and `since`",
+            ),
+            (
+                "[100]",
+                "a limit is a number, `all`, or a map of `rows` and `since`",
+            ),
+        ];
+        for (bad, message) in cases {
+            let yaml = format!("samplers:\n  - table: users\n    limit: {bad}\n");
+            let error = yaml.parse::<Config>().expect_err("the limit is invalid");
+            assert!(error.to_string().contains(message), "{bad}: {error}");
+        }
+    }
+
+    #[test]
+    fn says_where_time_column_went() {
+        let error = "samplers:\n  - table: orders\n    time_column: created_at\n"
+            .parse::<Config>()
+            .expect_err("time_column moved into limit");
+        assert!(
+            error
+                .to_string()
+                .contains("time_column moved into limit; write `limit: { since: created_at }`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_sampler_that_takes_nothing() {
+        let error = "samplers:\n  - table: countries\n"
+            .parse::<Config>()
+            .expect_err("a bare table takes no rows");
+        assert!(
+            error.to_string().contains(
+                "config sampler #1 (countries): takes no rows and declares no deps; write \
+                 `limit: all` to copy the whole table"
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_where_and_order_by_without_a_limit() {
+        for key in ["where: x = 1", "order_by: id DESC"] {
+            let yaml = format!("samplers:\n  - table: users\n    {key}\n");
             let error = yaml
                 .parse::<Config>()
-                .expect_err("an empty time_column is invalid");
-            assert!(error.to_string().contains("time_column"), "{bad}: {error}");
+                .expect_err("nothing to apply the key to");
+            assert!(
+                error.to_string().contains(
+                    "config sampler #1 (users): `where` and `order_by` need a `limit` to apply \
+                     to; write `limit: all` to take every row that matches"
+                ),
+                "{key}: {error}"
+            );
         }
+    }
+
+    #[test]
+    fn a_sampler_with_only_deps_or_of_is_valid_and_takes_nothing_on_its_own() -> Result<()> {
+        let config: Config = r#"
+samplers:
+  - table: invoices
+    deps:
+      customer_id: customers.id
+  - table: line_items
+    of:
+      order_id: orders.id
+"#
+        .parse()?;
+
+        assert!(
+            !config.samplers[0].takes_rows(),
+            "deps alone take no rows: {:?}",
+            config.samplers[0]
+        );
+        assert!(
+            config.samplers[1].takes_rows(),
+            "of picks the rows that belong to its parents"
+        );
+        Ok(())
     }
 
     #[test]
@@ -626,11 +904,17 @@ samplers:
         let dir = TempDir::new("globs")?;
         let shop = dir.write(
             "shop/tapas.yml",
-            "samplers:\n  - table: users\n  - table: orders\n",
+            "samplers:\n  - table: users\n    limit: all\n  - table: orders\n    limit: all\n",
         )?;
-        dir.write("billing/tapas.yml", "samplers:\n  - table: invoices\n")?;
+        dir.write(
+            "billing/tapas.yml",
+            "samplers:\n  - table: invoices\n    limit: all\n",
+        )?;
         dir.write("empty/tapas.yml", "samplers: []\n")?;
-        dir.write("other.yml", "samplers:\n  - table: ignored\n")?;
+        dir.write(
+            "other.yml",
+            "samplers:\n  - table: ignored\n    limit: all\n",
+        )?;
 
         // The glob also matches the file named explicitly; it's only loaded once.
         let config = Config::load(&[shop.clone(), dir.pattern("**/tapas.yml")])?;
@@ -660,7 +944,7 @@ samplers:
     #[test]
     fn names_the_file_that_fails() -> Result<()> {
         let dir = TempDir::new("bad-file")?;
-        dir.write("good.yml", "samplers:\n  - table: users\n")?;
+        dir.write("good.yml", "samplers:\n  - table: users\n    limit: all\n")?;
         let bad = dir.write("bad.yml", "samplers:\n  - table: users\n    limt: 1\n")?;
         let error = Config::load(&[dir.pattern("*.yml")]).expect_err("bad.yml has a typo");
         assert_eq!(error.to_string(), format!("parsing {bad}"));
@@ -672,6 +956,7 @@ samplers:
         let config: Config = r#"
 samplers:
   - table: users
+    limit: all
 sanitize:
   columns:
     "*_id": keep
@@ -775,7 +1060,7 @@ sanitize:
             ("'': keep", "a column pattern can't be empty"),
         ] {
             let yaml = format!(
-                "samplers:\n  - table: users\nsanitize:\n  tables:\n    users:\n      {rules}\n"
+                "samplers:\n  - table: users\n    limit: all\nsanitize:\n  tables:\n    users:\n      {rules}\n"
             );
             let error = yaml.parse::<Config>().expect_err("the rule is invalid");
             assert!(
@@ -794,12 +1079,12 @@ sanitize:
         )?;
         let payroll = dir.write(
             "payroll/tapas.yml",
-            "samplers:\n  - table: payroll_runs\nsanitize:\n  tables:\n    employees:\n      \
+            "samplers:\n  - table: payroll_runs\n    limit: all\nsanitize:\n  tables:\n    employees:\n      \
              ssn: { fake: ssn }\n",
         )?;
         let people = dir.write(
             "people/tapas.yml",
-            "samplers:\n  - table: employees\nsanitize:\n  tables:\n    employees:\n      \
+            "samplers:\n  - table: employees\n    limit: all\nsanitize:\n  tables:\n    employees:\n      \
              first_name: { fake: first_name }\n",
         )?;
 
@@ -822,7 +1107,7 @@ sanitize:
         let dir = TempDir::new("sanitize-clash")?;
         let first = dir.write(
             "a.yml",
-            "samplers:\n  - table: users\nsanitize:\n  columns:\n    ssn: { fake: ssn }\n  \
+            "samplers:\n  - table: users\n    limit: all\nsanitize:\n  columns:\n    ssn: { fake: ssn }\n  \
              tables:\n    users:\n      email: { fake: email }\n",
         )?;
         let second = dir.write("b.yml", "sanitize:\n  columns:\n    ssn: null\n")?;

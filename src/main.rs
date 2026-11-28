@@ -19,8 +19,8 @@ struct Args {
     #[arg(required = true)]
     configs: Vec<String>,
 
-    /// How far back samplers with a time_column reach, such as '2 weeks' or '3 months'.
-    /// Required when any sampler has a time_column; `ever` keeps every row.
+    /// How far back samplers whose limit has a `since` reach, such as '2 weeks' or '3 months'.
+    /// Required when any limit has a `since`; `ever` keeps every row.
     #[arg(long)]
     since: Option<Since>,
 

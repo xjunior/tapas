@@ -163,7 +163,14 @@ pub async fn extract(
         .iter()
         .map(|(name, table)| (name.as_str(), table.samplers.len()))
         .collect();
-    let mut done: HashSet<&str> = HashSet::new();
+    // A table nothing extracts from has no rows to wait for, so its children can start at once.
+    let mut done: HashSet<&str> = context
+        .plan
+        .tables
+        .iter()
+        .filter(|(_, table)| table.samplers.is_empty() && table.cycle.is_none())
+        .map(|(name, _)| name.as_str())
+        .collect();
     let mut started = Started {
         samplers: vec![false; context.plan.samplers.len()],
         cycles: vec![false; context.plan.cycles.len()],
@@ -231,6 +238,7 @@ fn start_ready(
 
     for (index, sampler) in plan.samplers.iter().enumerate() {
         if started.samplers[index]
+            || !sampler.takes_rows()
             || plan.tables[&sampler.table].cycle.is_some()
             || !sampler
                 .of
@@ -405,7 +413,7 @@ async fn run_sampler(context: &Arc<Shared>, index: usize, deps: Vec<Dep>) -> Res
         &format!("{}: running {} queries", sampler.origin, queries.len()),
     );
 
-    if let Some(limit) = sampler.limit {
+    if let Some(limit) = sampler.row_cap() {
         // Chunks run one after another so the limit holds across all of them.
         let mut remaining = limit;
         for query in queries {
