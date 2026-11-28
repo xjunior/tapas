@@ -408,18 +408,19 @@ async fn run_sampler(context: &Arc<Shared>, index: usize, deps: Vec<Dep>) -> Res
     if let Some(limit) = sampler.limit {
         // Chunks run one after another so the limit holds across all of them.
         let mut remaining = limit;
-        for mut query in queries {
+        for query in queries {
             if remaining == 0 {
                 break;
             }
-            query.extend_from_slice(format!(" LIMIT {remaining}").as_bytes());
-            remaining -= run_query(context, index, query).await?.min(remaining);
+            remaining -= run_query(context, index, query, Some(remaining))
+                .await?
+                .min(remaining);
         }
     } else {
         let mut running = JoinSet::new();
         for query in queries {
             let context = Arc::clone(context);
-            running.spawn(async move { run_query(&context, index, query).await });
+            running.spawn(async move { run_query(&context, index, query, None).await });
         }
         while let Some(finished) = running.join_next().await {
             finished.context("query task panicked")??;
@@ -428,11 +429,36 @@ async fn run_sampler(context: &Arc<Shared>, index: usize, deps: Vec<Dep>) -> Res
     Ok(())
 }
 
-/// Runs one SELECT, streaming its rows out as INSERTs. Returns the number of rows it returned.
-async fn run_query(context: &Shared, index: usize, query: Vec<u8>) -> Result<u64> {
-    match &context.source {
+/// Runs one SELECT of sampler `index`, up to `limit` rows, streaming its rows out as INSERTs.
+/// Returns the number of rows it returned.
+async fn run_query(
+    context: &Shared,
+    index: usize,
+    mut query: Vec<u8>,
+    limit: Option<u64>,
+) -> Result<u64> {
+    push_limit(&mut query, limit);
+    let ran = match &context.source {
         Source::MySql(pool) => run_mysql_query(context, index, pool, &query).await,
         Source::Postgres(pool) => run_postgres_query(context, index, pool, &query).await,
+    };
+    ran.with_context(|| format!("running {}", shown_query(context, index, &query, limit)))
+}
+
+/// A query of sampler `index` as its errors show it: in full with `debug`, or else as its
+/// outline, which writes each list of values as the column they come from.
+fn shown_query(context: &Shared, index: usize, query: &[u8], limit: Option<u64>) -> String {
+    if context.options.debug {
+        return String::from_utf8_lossy(query).into_owned();
+    }
+    let mut outline = context.plan.query_outline(index, context.source.dialect());
+    push_limit(&mut outline, limit);
+    String::from_utf8_lossy(&outline).into_owned()
+}
+
+fn push_limit(query: &mut Vec<u8>, limit: Option<u64>) {
+    if let Some(limit) = limit {
+        query.extend_from_slice(format!(" LIMIT {limit}").as_bytes());
     }
 }
 
@@ -441,10 +467,7 @@ async fn run_mysql_query(context: &Shared, index: usize, pool: &Pool, query: &[u
     use mysql_async::prelude::Queryable;
 
     let mut connection = pool.get_conn().await?;
-    let mut result = connection
-        .query_iter(query)
-        .await
-        .with_context(|| format!("running {}", String::from_utf8_lossy(query)))?;
+    let mut result = connection.query_iter(query).await?;
     let Some(mut stream) = result.stream::<Row>().await? else {
         return Ok(0);
     };
@@ -498,22 +521,16 @@ async fn run_postgres_query(
 ) -> Result<u64> {
     use futures_util::StreamExt;
 
-    let running = || format!("running {}", String::from_utf8_lossy(query));
     // Built from the config and from values Postgres sent as text, so always UTF-8.
-    let query = str::from_utf8(query).with_context(running)?;
+    let query = str::from_utf8(query)?;
     let connection = pool.get().await?;
-    let messages = connection
-        .simple_query_raw(query)
-        .await
-        .with_context(running)?;
+    let messages = connection.simple_query_raw(query).await?;
     let mut messages = pin::pin!(messages);
 
     let columns = loop {
         match messages.next().await {
             Some(message) => {
-                if let SimpleQueryMessage::RowDescription(columns) =
-                    message.with_context(running)?
-                {
+                if let SimpleQueryMessage::RowDescription(columns) = message? {
                     break columns;
                 }
             }
@@ -528,7 +545,7 @@ async fn run_postgres_query(
     let mut batcher = Batcher::try_new(context, index, &names, &kinds)?;
 
     while let Some(message) = messages.next().await {
-        let SimpleQueryMessage::Row(row) = message.with_context(running)? else {
+        let SimpleQueryMessage::Row(row) = message? else {
             continue;
         };
         let mut literals = Vec::with_capacity(names.len());

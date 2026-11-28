@@ -116,8 +116,11 @@ Treat the seed like a password, and keep it off the command line the same way: s
 
 ## `--debug`
 
-Shows the values in errors. Without it, a statement the target refuses shows only its table and columns, so errors
-that end up in CI logs hold no data:
+Shows the values in errors. Without it, tapas keeps the sample's values out of its errors, so they're safe in CI logs:
+
+- A query the source fails shows each list of values as the column they come from, as `--plan` does:
+  ``running SELECT * FROM `phones` WHERE `user_id` IN (<users.id>)``.
+- A statement the target refuses shows only its table and columns:
 
 ```
 Error: writing to the target
@@ -127,7 +130,8 @@ Caused by:
     1: Server error: `ERROR 1406 (22001): Data too long for column 'name' at row 3'
 ```
 
-With `--debug`, the error shows the whole statement, so you can see which row the target refused:
+With `--debug`, the query shows its values, and the error shows the whole statement, so you can see which row the
+target refused:
 
 ```
 Caused by:
@@ -140,6 +144,9 @@ Caused by:
 
 The rows are as tapas writes them, so [sanitized](sanitization.md) columns hold their replacements. A statement holds
 up to `--batch-rows` rows; add `--batch-rows 1` to narrow the error down to one row.
+
+The database's own messages can quote a value with or without `--debug`, such as MySQL's
+`Duplicate entry '5' for key 'users.PRIMARY'` or Postgres's `Failing row contains (…)`.
 
 ## `--plan`
 
